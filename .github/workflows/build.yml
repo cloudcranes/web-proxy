@@ -47,8 +47,7 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value={{ref_name}},enable={{is_tag}}
+            type=raw,value=latest
           flavor: |
             latest=auto
 
