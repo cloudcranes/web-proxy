@@ -1,0 +1,14 @@
+target/
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+*.log
+Cargo.lock
+docker-compose*.yaml
+compose*.yaml
+.env
+.env.*
+!.env.example
+README.md

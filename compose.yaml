@@ -1,0 +1,21 @@
+services:
+  accelerator:
+    image: ghcr.io/cloudcranes/web-proxy:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "20516:20516"
+    env_file:
+      - .env
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
