@@ -14,7 +14,7 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src \
     && echo "fn main() {}" > src/main.rs \
-    && cargo build --release --locked --offline=false \
+    && cargo build --release --locked \
     && rm -rf src target/release/deps/edge_accelerator*
 COPY src ./src
 RUN cargo build --release --locked \
