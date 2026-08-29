@@ -51,19 +51,6 @@ jobs:
           flavor: |
             latest=auto
 
-      - name: Build (and push on non-PR)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
-
       - name: Compile-check + lint (fail fast, surfaces errors in step summary)
         if: github.event_name != 'pull_request'
         id: lint
@@ -92,3 +79,16 @@ jobs:
             exit 1
           fi
           exit 0
+
+      - name: Build (and push on non-PR)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
