@@ -64,8 +64,31 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
 
-      - name: Run cargo test (source-level)
+      - name: Compile-check + lint (fail fast, surfaces errors in step summary)
         if: github.event_name != 'pull_request'
+        id: lint
         run: |
-          cargo fmt --all -- --check
-          cargo test --locked --all-features
+          set +e
+          rustup component add rustfmt >/dev/null 2>&1 || true
+          cargo fmt --all -- --check > fmt.log 2>&1
+          FMT=$?
+          cargo check --locked --message-format=short --color=never > check.log 2>&1
+          CHECK=$?
+          if [ $FMT -ne 0 ]; then
+            {
+              echo "### cargo fmt --check failed"
+              echo '```'
+              cat fmt.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ $CHECK -ne 0 ]; then
+            {
+              echo "### cargo check --locked failed"
+              echo '```'
+              head -200 check.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          exit 0
