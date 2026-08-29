@@ -11,7 +11,7 @@ ENV CARGO_HOME=/usr/local/cargo \
 RUN apt-get update \
     && apt-get install --no-install-recommends -y pkg-config ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src \
     && echo "fn main() {}" > src/main.rs \
     && cargo build --release --locked --offline=false \
