@@ -28,7 +28,10 @@ RUN apt-get update \
     && useradd --system --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
 COPY --from=builder /workspace/target/release/web-proxy /usr/local/bin/web-proxy
 COPY docker/healthcheck.sh /usr/local/bin/healthcheck.sh
-RUN chmod 0555 /usr/local/bin/web-proxy /usr/local/bin/healthcheck.sh
+RUN chmod 0555 /usr/local/bin/web-proxy /usr/local/bin/healthcheck.sh \
+    && mkdir -p /data \
+    && chown app:app /data
 USER app:app
+VOLUME ["/data"]
 EXPOSE 20516
 ENTRYPOINT ["/usr/local/bin/web-proxy"]
