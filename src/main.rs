@@ -616,9 +616,19 @@ async fn tee_blob_to_cache(
     hex: String,
 ) {
     let part_path = cache.new_part_path(&hex);
-    let mut file = match tokio::fs::File::create(&part_path).await {
+    // File::create does not make parent dirs; the digest shard must exist first.
+    let dir_ready = match part_path.parent() {
+        Some(dir) => tokio::fs::create_dir_all(dir).await.is_ok(),
+        None => false,
+    };
+    let opened = match dir_ready {
+        true => tokio::fs::File::create(&part_path).await,
+        false => Err(std::io::Error::other("cache dir unavailable")),
+    };
+    let mut file = match opened {
         Ok(file) => file,
-        Err(_) => {
+        Err(error) => {
+            warn!(%error, hex, "cache write unavailable; streaming without caching");
             // Cache unavailable: degrade to plain streaming.
             stream_to_channel(upstream.bytes_stream(), &tx).await;
             return;
