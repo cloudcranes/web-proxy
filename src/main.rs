@@ -29,6 +29,7 @@ const DOCKER_API_VERSION: &str = "docker-distribution-api-version";
 const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 const PROBE_TOKEN: &str = "edge-registry-probe";
 const UPSTREAM_READ_TIMEOUT_SECS: u64 = 1800;
+const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
 
 const GIT_PROTOCOL_HEADER: HeaderName = HeaderName::from_static(GIT_PROTOCOL);
 
@@ -93,7 +94,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "edge_accelerator=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "web_proxy=info,tower_http=info".into()),
         )
         .init();
 
@@ -107,6 +108,7 @@ async fn main() -> Result<()> {
     let connect_timeout = env_parse("UPSTREAM_CONNECT_TIMEOUT_SECS", 10_u64)?;
     let max_redirects = env_parse("MAX_REDIRECTS", 8_usize)?;
     let max_concurrent_requests = env_parse("MAX_CONCURRENT_REQUESTS", 128_usize)?;
+    let drain_timeout = env_parse("SHUTDOWN_DRAIN_TIMEOUT_SECS", DEFAULT_DRAIN_TIMEOUT_SECS)?;
     if max_redirects == 0 || max_concurrent_requests == 0 {
         bail!("MAX_REDIRECTS and MAX_CONCURRENT_REQUESTS must be greater than zero");
     }
@@ -137,10 +139,17 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
     info!(%listen_addr, "listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serve HTTP")
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    tokio::select! {
+        result = server => result.context("serve HTTP"),
+        // Cap how long in-flight blob transfers may hold the process after
+        // the shutdown signal; past this point connections are dropped so
+        // container stops don't hang until the runtime kill timeout.
+        _ = drain_deadline(drain_timeout) => {
+            warn!(drain_timeout_secs = drain_timeout, "drain timeout exceeded; closing remaining connections");
+            Ok(())
+        }
+    }
 }
 
 async fn healthz(State(state): State<Arc<AppState>>, request: Request) -> Response {
@@ -728,6 +737,11 @@ where
         Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(error).with_context(|| format!("read {name}")),
     }
+}
+
+async fn drain_deadline(timeout_secs: u64) {
+    shutdown_signal().await;
+    tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
 }
 
 async fn shutdown_signal() {

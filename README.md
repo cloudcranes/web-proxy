@@ -1,4 +1,4 @@
-# web-proxy (edge-accelerator)
+# web-proxy
 
 EdgeOne / 反代前置的容器镜像与 GitHub 加速器。单二进制 axum + reqwest + rustls 实现。
 
@@ -24,6 +24,7 @@ EdgeOne / 反代前置的容器镜像与 GitHub 加速器。单二进制 axum + 
 | `MAX_CONCURRENT_REQUESTS` | 否 | `128` | 全局并发上限 |
 | `MAX_REDIRECTS` | 否 | `8` | 上游重定向跟随上限 |
 | `UPSTREAM_CONNECT_TIMEOUT_SECS` | 否 | `10` | reqwest 连接超时 |
+| `SHUTDOWN_DRAIN_TIMEOUT_SECS` | 否 | `30` | 收到停止信号后等待在途请求排空的上限，超时强制断开 |
 | `RUST_LOG` | 否 | `info` | tracing 日志级别 |
 
 ## 部署
@@ -34,7 +35,7 @@ cp .env.example .env
 docker compose up -d
 ```
 
-`compose.yaml` 已加固：`read_only: true` + `cap_drop: [ALL]` + `pids_limit: 512` + `cpus: 2.0` + `no-new-privileges`。
+`compose.yaml` 已加固：`read_only: true` + `cap_drop: [ALL]` + `pids_limit: 512` + `cpus: 2.0` + `mem_limit: 512m` + `no-new-privileges`。
 
 ## 安全模型
 
@@ -80,7 +81,7 @@ Git Bash 下 `link.exe` 与 MSVC linker 冲突，无法本地构建；推送后�
 
 - `rewrite_scope` 仅接受 `pull` 单动作；不支持 `push`
 - streaming 响应无总体积上限（单 blob 受 EdgeOne 边缘层限制）
-- `axum::serve` graceful shutdown 等待在途请求自然完成，无硬性排空超时
+- graceful shutdown 排空上限默认 30s（`SHUTDOWN_DRAIN_TIMEOUT_SECS`），超时后剩余连接被强制断开
 
 ## LICENSE
 

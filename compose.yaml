@@ -18,6 +18,7 @@ services:
       - ALL
     pids_limit: 512
     cpus: "2.0"
+    mem_limit: 512m
     healthcheck:
       test: ["CMD", "/healthcheck.sh"]
       interval: 30s

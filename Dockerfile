@@ -15,10 +15,10 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src \
     && echo "fn main() {}" > src/main.rs \
     && cargo build --release --locked \
-    && rm -rf src target/release/deps/edge_accelerator*
+    && rm -rf src target/release/deps/web_proxy*
 COPY src ./src
 RUN cargo build --release --locked \
-    && strip target/release/edge-accelerator
+    && strip target/release/web-proxy
 
 FROM ${DEBIAN_IMAGE} AS runtime
 RUN apt-get update \
@@ -26,9 +26,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
-COPY --from=builder /workspace/target/release/edge-accelerator /usr/local/bin/edge-accelerator
+COPY --from=builder /workspace/target/release/web-proxy /usr/local/bin/web-proxy
 COPY docker/healthcheck.sh /usr/local/bin/healthcheck.sh
-RUN chmod 0555 /usr/local/bin/edge-accelerator /usr/local/bin/healthcheck.sh
+RUN chmod 0555 /usr/local/bin/web-proxy /usr/local/bin/healthcheck.sh
 USER app:app
 EXPOSE 20516
-ENTRYPOINT ["/usr/local/bin/edge-accelerator"]
+ENTRYPOINT ["/usr/local/bin/web-proxy"]
