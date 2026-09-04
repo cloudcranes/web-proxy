@@ -179,7 +179,7 @@ pub struct CachedManifest {
     pub content_type: Option<String>,
     pub docker_digest: Option<String>,
     pub body: axum::body::Bytes,
-    stored: Instant,
+    pub stored: Instant,
 }
 
 pub struct ManifestCache {
