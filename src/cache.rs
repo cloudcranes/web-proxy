@@ -150,7 +150,7 @@ impl DiskCache {
                 if !meta.is_file() {
                     continue;
                 }
-                let modified = meta.modified().await.unwrap_or(SystemTime::UNIX_EPOCH);
+                let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 if path.extension().is_some_and(|e| e == "part")
                     && modified.elapsed().unwrap_or_default() < PART_MAX_AGE
                 {

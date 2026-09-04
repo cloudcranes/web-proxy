@@ -138,12 +138,13 @@ async fn main() -> Result<()> {
     }
 
     let cache_dir = PathBuf::from(env_or("CACHE_DIR", "/data"));
+    let cache_dir_display = cache_dir.display().to_string();
     let cache_max_gb = env_parse("CACHE_MAX_GB", 10_u64)?;
     let cache = DiskCache::new(cache_dir, cache_max_gb.saturating_mul(1024 * 1024 * 1024));
     cache
         .init()
         .await
-        .with_context(|| format!("init blob cache at {}", cache_dir.display()))?;
+        .with_context(|| format!("init blob cache at {cache_dir_display}"))?;
     info!(
         cache_max_gb,
         on_disk_mib = cache.bytes_on_disk() / 1024 / 1024,
@@ -447,7 +448,7 @@ async fn proxy_manifest(
     };
     if upstream.status() == StatusCode::UNAUTHORIZED {
         let mut response = streaming_response(upstream, head);
-        rewrite_401_challenge(&mut response, state, registry, &path, &origin);
+        rewrite_401_challenge(&mut response, registry, &path, &origin);
         return response;
     }
     if head || !upstream.status().is_success() {
@@ -567,7 +568,7 @@ async fn proxy_blob(
     };
     if !upstream.status().is_success() {
         let mut response = streaming_response(upstream, head);
-        rewrite_401_challenge(&mut response, state, registry, &path, &origin);
+        rewrite_401_challenge(&mut response, registry, &path, &origin);
         return response;
     }
     if head {
@@ -727,13 +728,7 @@ async fn passthrough_registry(
     };
     let mut response = streaming_response(upstream, head);
     if response.status() == StatusCode::UNAUTHORIZED {
-        rewrite_401_challenge(
-            &mut response,
-            state,
-            registry,
-            &path,
-            &origin_for(state, host),
-        );
+        rewrite_401_challenge(&mut response, registry, &path, &origin_for(state, host));
     }
     response
 }
@@ -888,7 +883,7 @@ async fn buffered_response(upstream: reqwest::Response, head: bool, max_bytes: u
 }
 
 async fn cached_blob_response(hit: CachedBlob, head: bool, digest: &str) -> Response {
-    let mut builder = Response::builder()
+    let builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_LENGTH, hit.size)
         .header(
@@ -924,7 +919,7 @@ fn file_stream(file: tokio::fs::File) -> Body {
 
 fn copy_request_headers(
     headers: &HeaderMap,
-    mut builder: reqwest::RequestBuilder,
+    builder: reqwest::RequestBuilder,
     registry: bool,
 ) -> reqwest::RequestBuilder {
     let allowed: &[HeaderName] = if registry {
@@ -1001,13 +996,7 @@ fn registry_url(
     Ok(url)
 }
 
-fn rewrite_401_challenge(
-    response: &mut Response,
-    state: &AppState,
-    registry: Registry,
-    path: &str,
-    origin: &str,
-) {
+fn rewrite_401_challenge(response: &mut Response, registry: Registry, path: &str, origin: &str) {
     if response.status() != StatusCode::UNAUTHORIZED {
         return;
     }
