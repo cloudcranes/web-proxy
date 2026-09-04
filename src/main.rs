@@ -497,7 +497,7 @@ fn copy_request_headers(
     builder: &mut reqwest::RequestBuilder,
     registry: bool,
 ) {
-    let allowed: &[&HeaderName] = if registry {
+    let allowed: &[HeaderName] = if registry {
         &[
             AUTHORIZATION,
             ACCEPT,
@@ -517,7 +517,7 @@ fn copy_request_headers(
             IF_NONE_MATCH,
             IF_MODIFIED_SINCE,
             USER_AGENT,
-            &GIT_PROTOCOL_HEADER,
+            GIT_PROTOCOL_HEADER,
         ]
     };
 
@@ -525,8 +525,8 @@ fn copy_request_headers(
     // If-None-Match tags) survive — reqwest's per-call `.header()` replaces.
     let mut forwarded = HeaderMap::with_capacity(allowed.len());
     for name in allowed {
-        for value in headers.get_all(*name) {
-            forwarded.append((*name).clone(), value.clone());
+        for value in headers.get_all(name) {
+            forwarded.append(name.clone(), value.clone());
         }
     }
     *builder = builder.headers(forwarded);
