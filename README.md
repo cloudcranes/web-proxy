@@ -85,4 +85,4 @@ Git Bash 下 `link.exe` 与 MSVC linker 冲突，无法本地构建；推送后�
 
 ## LICENSE
 
-未声明。公仓使用前请补 LICENSE 文件（推荐 MIT 或 Apache-2.0）。
+[MIT](LICENSE)
