@@ -57,26 +57,14 @@ jobs:
         run: |
           set +e
           rustup component add rustfmt >/dev/null 2>&1 || true
-          cargo fmt --all -- --check > fmt.log 2>&1
-          FMT=$?
-          cargo check --locked --message-format=short --color=never > check.log 2>&1
-          CHECK=$?
-          if [ $FMT -ne 0 ]; then
-            {
-              echo "### cargo fmt --check failed"
-              echo '```'
-              cat fmt.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-          if [ $CHECK -ne 0 ]; then
-            {
-              echo "### cargo check --locked failed"
-              echo '```'
-              head -200 check.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          echo "## fmt log" >> "$GITHUB_STEP_SUMMARY"
+          cargo fmt --all -- --check 2>&1 | tee fmt.log
+          FMT=${PIPESTATUS[0]}
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## check log" >> "$GITHUB_STEP_SUMMARY"
+          cargo check --locked --message-format=short --color=never 2>&1 | tee check.log
+          CHECK=${PIPESTATUS[0]}
+          echo "FMT=$FMT CHECK=$CHECK" >> "$GITHUB_STEP_SUMMARY"
           [ $FMT -eq 0 ] && [ $CHECK -eq 0 ]
 
       - name: Run unit tests
