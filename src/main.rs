@@ -114,7 +114,6 @@ async fn main() -> Result<()> {
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(connect_timeout))
         .read_timeout(Duration::from_secs(UPSTREAM_READ_TIMEOUT_SECS))
-        .timeout(None)
         .redirect(Policy::none())
         .build()
         .context("build HTTP client")?;
@@ -235,7 +234,7 @@ fn registry_root(state: &AppState, method: &Method, headers: &HeaderMap) -> Resp
         HeaderName::from_static(DOCKER_API_VERSION),
         HeaderValue::from_static("registry/2.0"),
     );
-    if let Ok(value) = registry_challenge(&state.public_base_url) {
+    if let Ok(value) = registry_challenge(&state.public_base_url, None) {
         response.headers_mut().insert(WWW_AUTHENTICATE, value);
     }
     response
@@ -292,7 +291,7 @@ async fn proxy_token(
 
     let mut builder = state.client.request(method.clone(), url);
     // Public-only mode: never forward client registry credentials to token issuers.
-    copy_request_headers(headers, &mut builder, false);
+    builder = copy_request_headers(headers, builder, false);
     let upstream = match builder.send().await {
         Ok(response) => response,
         Err(error) => return upstream_error(error),
@@ -388,7 +387,7 @@ async fn send_streaming(
         }
 
         let mut builder = state.client.request(method.clone(), url.clone());
-        copy_request_headers(&current_headers, &mut builder, registry);
+        builder = copy_request_headers(&current_headers, builder, registry);
         if let Some(bytes) = body.clone() {
             builder = builder.body(bytes);
         }
@@ -494,9 +493,9 @@ async fn buffered_response(upstream: reqwest::Response, head: bool) -> Response 
 
 fn copy_request_headers(
     headers: &HeaderMap,
-    builder: &mut reqwest::RequestBuilder,
+    mut builder: reqwest::RequestBuilder,
     registry: bool,
-) {
+) -> reqwest::RequestBuilder {
     let allowed: &[HeaderName] = if registry {
         &[
             AUTHORIZATION,
@@ -529,7 +528,7 @@ fn copy_request_headers(
             forwarded.append(name.clone(), value.clone());
         }
     }
-    *builder = builder.headers(forwarded);
+    builder.headers(forwarded)
 }
 
 fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
