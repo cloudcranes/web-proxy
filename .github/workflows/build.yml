@@ -76,9 +76,11 @@ jobs:
               head -200 check.log
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
           fi
-          exit 0
+          [ $FMT -eq 0 ] && [ $CHECK -eq 0 ]
+
+      - name: Run unit tests
+        run: cargo test --locked --no-fail-fast --color=never
 
       - name: Build (and push on non-PR)
         uses: docker/build-push-action@v5

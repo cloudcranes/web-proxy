@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
-PORT="${LISTEN_PORT:-20516}"
+LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:20516}"
 HOST="127.0.0.1"
+# Default 20516 also covers IPv6 forms like "[::]:20516" (last colon wins).
+PORT="${LISTEN_ADDR##*:}"
 SECRET="${ORIGIN_SECRET:-}"
 if [ -z "${SECRET}" ]; then
   echo "ORIGIN_SECRET not set" >&2

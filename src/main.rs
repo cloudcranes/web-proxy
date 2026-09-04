@@ -28,6 +28,9 @@ const GIT_PROTOCOL: &str = "git-protocol";
 const DOCKER_API_VERSION: &str = "docker-distribution-api-version";
 const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 const PROBE_TOKEN: &str = "edge-registry-probe";
+const UPSTREAM_READ_TIMEOUT_SECS: u64 = 1800;
+
+const GIT_PROTOCOL_HEADER: HeaderName = HeaderName::from_static(GIT_PROTOCOL);
 
 const GITHUB_HOSTS: &[&str] = &[
     "github.com",
@@ -110,6 +113,7 @@ async fn main() -> Result<()> {
 
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(connect_timeout))
+        .read_timeout(Duration::from_secs(UPSTREAM_READ_TIMEOUT_SECS))
         .timeout(None)
         .redirect(Policy::none())
         .build()
@@ -493,7 +497,7 @@ fn copy_request_headers(
     builder: &mut reqwest::RequestBuilder,
     registry: bool,
 ) {
-    let allowed = if registry {
+    let allowed: &[&HeaderName] = if registry {
         &[
             AUTHORIZATION,
             ACCEPT,
@@ -503,7 +507,7 @@ fn copy_request_headers(
             IF_NONE_MATCH,
             IF_MODIFIED_SINCE,
             USER_AGENT,
-        ][..]
+        ]
     } else {
         &[
             ACCEPT,
@@ -513,17 +517,19 @@ fn copy_request_headers(
             IF_NONE_MATCH,
             IF_MODIFIED_SINCE,
             USER_AGENT,
-            HeaderName::from_static(GIT_PROTOCOL),
-        ][..]
+            &GIT_PROTOCOL_HEADER,
+        ]
     };
 
+    // Accumulate into one HeaderMap so multi-valued entries (e.g. multiple
+    // If-None-Match tags) survive — reqwest's per-call `.header()` replaces.
+    let mut forwarded = HeaderMap::with_capacity(allowed.len());
     for name in allowed {
-        for value in headers.get_all(name).iter() {
-            if let Some(next) = builder.try_clone() {
-                *builder = next.header(name, value);
-            }
+        for value in headers.get_all(*name) {
+            forwarded.append((*name).clone(), value.clone());
         }
     }
+    *builder = builder.headers(forwarded);
 }
 
 fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {

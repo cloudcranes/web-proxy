@@ -14,6 +14,10 @@ services:
       - /tmp
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    cpus: "2.0"
     healthcheck:
       test: ["CMD", "/healthcheck.sh"]
       interval: 30s
