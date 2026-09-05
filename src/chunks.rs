@@ -343,11 +343,30 @@ async fn fetch_chunk(
 
     let status = response.status();
     if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-        total_received.fetch_add(0, Ordering::Relaxed);
-        return Ok(());
+        // A 416 means nothing was written for this chunk. Treating it as
+        // success would mark the chunk done and leave a hole in the part
+        // file, so fail instead and let the retry loop handle it.
+        bail!("chunk {offset} HTTP 416 range not satisfiable");
     }
     if !status.is_success() {
         bail!("chunk {offset} HTTP {status}");
+    }
+    if let Some(content_range) = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+    {
+        // "bytes <start>-<end>/<total>": a start that drifts from the
+        // requested offset would silently corrupt the assembled blob.
+        let reported_start = content_range
+            .strip_prefix("bytes ")
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|start| start.parse::<u64>().ok());
+        if let Some(start) = reported_start {
+            if start != offset {
+                bail!("chunk {offset} upstream returned Content-Range starting at {start}");
+            }
+        }
     }
     let mut stream = response.bytes_stream();
     let mut cursor = offset;
