@@ -111,6 +111,11 @@ struct AppState {
     manifests: Arc<ManifestCache>,
     stats: Arc<Stats>,
     pulls: Arc<dockerpull::PullManager>,
+    /// Address the Docker daemon should use to reach this gateway for
+    /// pull-as-a-service (e.g. "192.168.1.107:20516"). The request Host
+    /// header can be wrong (localhost, EdgeOne domain), and the daemon's TLS
+    /// verification needs a name the certificate actually covers.
+    pull_via_host: Option<String>,
     started: Instant,
 }
 
@@ -235,6 +240,7 @@ async fn main() -> Result<()> {
         manifests: Arc::new(manifests),
         stats: Arc::new(Stats::default()),
         pulls: dockerpull::PullManager::new(env_or("DOCKER_SOCKET", "/var/run/docker.sock")),
+        pull_via_host: env::var("PULL_VIA_HOST").ok().filter(|v| !v.is_empty()),
         started: Instant::now(),
     });
 
@@ -492,13 +498,17 @@ async fn start_pull(State(state): State<Arc<AppState>>, request: Request) -> Res
     if request.method() != Method::POST {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    // The daemon must reach us to pull, so reuse the caller's Host header.
-    let gateway_host = request
-        .headers()
-        .get(HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1")
-        .to_owned();
+    // The daemon must reach us to pull. Prefer the explicit PULL_VIA_HOST;
+    // the request Host header is only a fallback (it can be localhost or a
+    // proxied domain, neither of which the daemon can verify/reach).
+    let gateway_host = state.pull_via_host.clone().unwrap_or_else(|| {
+        request
+            .headers()
+            .get(HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("127.0.0.1")
+            .to_owned()
+    });
     let bytes = match request.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid body\n").into_response(),
