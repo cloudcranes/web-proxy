@@ -172,6 +172,16 @@ impl DiskCache {
         }
         self.on_disk.store(total, Ordering::Relaxed);
     }
+
+    /// Clear all cached blobs and temporary part files.
+    pub async fn clear(&self) -> u64 {
+        let _guard = self.evict_lock.lock().await;
+        let freed = self.bytes_on_disk();
+        let _ = tokio::fs::remove_dir_all(self.root.join("sha256")).await;
+        let _ = tokio::fs::create_dir_all(self.root.join("sha256")).await;
+        self.on_disk.store(0, Ordering::Relaxed);
+        freed
+    }
 }
 
 #[derive(Clone)]
@@ -213,5 +223,10 @@ impl ManifestCache {
             }
         }
         map.insert(key, value);
+    }
+
+    pub async fn clear(&self) {
+        let mut map = self.entries.lock().await;
+        map.clear();
     }
 }
