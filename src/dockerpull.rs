@@ -288,12 +288,17 @@ async fn docker_pull(socket: &str, job: &PullJob) -> Result<String> {
         }
     });
 
-    let mut uri = format!("/images/create?fromImage={}", job.spec.pull_repo);
+    // fromImage contains ':' and '/', which the daemon wants percent-encoded
+    // in the query or it 500s.
+    let mut uri = format!(
+        "/images/create?fromImage={}",
+        percent_encode_path(&job.spec.pull_repo)
+    );
     if let Some(tag) = &job.spec.tag {
-        uri.push_str(&format!("&tag={tag}"));
+        uri.push_str(&format!("&tag={}", percent_encode_path(tag)));
     }
     if let Some(digest) = &job.spec.digest {
-        uri.push_str(&format!("&digest={digest}"));
+        uri.push_str(&format!("&digest={}", percent_encode_path(digest)));
     }
 
     let request = HyperRequest::builder()
