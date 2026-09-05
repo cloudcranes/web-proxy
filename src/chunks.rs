@@ -125,7 +125,8 @@ pub async fn download(
     let total_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CHUNKS));
 
-    let mut handles = Vec::with_capacity(chunks_total);
+    let mut tasks: tokio::task::JoinSet<anyhow::Result<(Chunk, bool)>> =
+        tokio::task::JoinSet::new();
     for chunk in &chunks {
         let is_already_done = existing_bitmap[chunk.index];
         let sem = Arc::clone(&sem);
@@ -137,7 +138,7 @@ pub async fn download(
         let path = path.clone();
         let chunk = *chunk;
 
-        handles.push(tokio::spawn(async move {
+        tasks.spawn(async move {
             if is_already_done {
                 return Ok::<_, anyhow::Error>((chunk, true));
             }
@@ -187,7 +188,7 @@ pub async fn download(
                     }
                 }
             }
-        }));
+        });
     }
 
     let mut ordered: Vec<Option<Bytes>> = vec![None; chunks_total];
@@ -197,15 +198,17 @@ pub async fn download(
     let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
 
     while chunks_remaining > 0 {
-        let ((result, _), _, _) = futures_util::future::select_all(handles.iter_mut().map(|h| {
-            Box::pin(async move {
-                let outcome = h.await.expect("join task");
-                (outcome, 0usize)
-            })
-        }))
-        .await;
-
-        let (chunk, from_cache) = match result {
+        // JoinSet removes finished tasks as they yield, so completed chunk
+        // tasks are never awaited twice (re-polling a JoinHandle panics).
+        let joined = tasks
+            .join_next()
+            .await
+            .expect("chunk tasks remain while chunks_remaining > 0");
+        let outcome = match joined {
+            Ok(pair) => pair,
+            Err(join_error) => return Err(anyhow::anyhow!("chunk task aborted: {join_error}")),
+        };
+        let (chunk, from_cache) = match outcome {
             Ok(pair) => pair,
             Err(error) => return Err(error.context("a chunk fetch exhausted retries")),
         };
