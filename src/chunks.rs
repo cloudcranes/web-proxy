@@ -348,6 +348,13 @@ async fn fetch_chunk(
         // file, so fail instead and let the retry loop handle it.
         bail!("chunk {offset} HTTP 416 range not satisfiable");
     }
+    if status == reqwest::StatusCode::OK {
+        // A 200 to a Range request means the upstream ignored the range and
+        // would stream the whole blob from byte 0 - writing that at a chunk
+        // offset corrupts the assembly (observed intermittently on CDN
+        // edges). Fail and retry, hoping for a range-aware endpoint.
+        bail!("chunk {offset} upstream ignored Range (HTTP 200 instead of 206)");
+    }
     if !status.is_success() {
         bail!("chunk {offset} HTTP {status}");
     }
