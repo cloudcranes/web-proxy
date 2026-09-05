@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
-use serde::Deserialize;
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -74,13 +73,13 @@ impl SourcePool {
         // Seed an initial probe so the first download isn't blind.
         let seed = Arc::clone(&pool);
         tokio::spawn(async move {
-            seed.probe_all().await;
+            Self::probe_all_arc(seed).await;
         });
         let prober = Arc::clone(&pool);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(PROBE_INTERVAL).await;
-                prober.probe_all().await;
+                Self::probe_all_arc(Arc::clone(&prober)).await;
             }
         });
         pool
@@ -192,16 +191,16 @@ impl SourcePool {
         }
     }
 
-    async fn probe_all(self: Arc<Self>) {
-        for i in 0..self.specs.len() {
-            let me = Arc::clone(&self);
-            tokio::spawn(async move { me.probe_one(i).await });
+    async fn probe_all_arc(pool: Arc<Self>) {
+        for i in 0..pool.specs.len() {
+            let me = Arc::clone(&pool);
+            tokio::spawn(async move { Self::probe_one_arc(me, i).await });
         }
-        self.recompute_weights().await;
+        pool.recompute_weights().await;
     }
 
-    async fn probe_one(self: Arc<Self>, index: usize) {
-        let spec = self.specs[index].clone();
+    async fn probe_one_arc(pool: Arc<Self>, index: usize) {
+        let spec = pool.specs[index].clone();
         let url = match Url::parse(&spec.registry_url)
             .ok()
             .and_then(|u| u.join(PROBE_PATH).ok())
@@ -212,7 +211,7 @@ impl SourcePool {
         let started = Instant::now();
         let result = tokio::time::timeout(
             PROBE_TIMEOUT,
-            self.client.head(url.clone()).header("Accept", "*/*").send(),
+            pool.client.head(url.clone()).header("Accept", "*/*").send(),
         )
         .await;
         let elapsed_ms = started.elapsed().as_millis() as u32;
@@ -225,7 +224,7 @@ impl SourcePool {
                     .and_then(|v| v.to_str().ok())
                     .map(|v| v.eq_ignore_ascii_case("bytes"))
                     .unwrap_or(false);
-                let mut stats = self.stats.write().await;
+                let mut stats = pool.stats.write().await;
                 if let Some(slot) = stats.get_mut(index) {
                     if status.is_success() || status.as_u16() == 401 {
                         slot.success = slot.success.saturating_add(1);
@@ -238,7 +237,7 @@ impl SourcePool {
                 }
             }
             _ => {
-                let mut stats = self.stats.write().await;
+                let mut stats = pool.stats.write().await;
                 if let Some(slot) = stats.get_mut(index) {
                     slot.failure = slot.failure.saturating_add(1);
                     slot.last_seen = Some(Instant::now());
@@ -291,27 +290,39 @@ pub fn load_or_default(
 }
 
 fn parse(text: &str) -> Result<Vec<SourceSpec>> {
-    #[derive(serde::Deserialize)]
-    struct Toml {
-        sources: Vec<JsonSource>,
-    }
-    #[derive(serde::Deserialize)]
-    struct JsonSource {
-        name: String,
-        registry: String,
-        token: String,
-        service: String,
-    }
-    let parsed: Toml = serde_json::from_str(text).map_err(|e| anyhow!("sources.json: {e}"))?;
-    let mut out = Vec::with_capacity(parsed.sources.len());
-    for ts in parsed.sources {
-        validate_https(&ts.registry)?;
-        validate_https(&ts.token)?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| anyhow!("sources.json: {e}"))?;
+    let array = parsed
+        .get("sources")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("sources.json missing 'sources' array"))?;
+    let mut out = Vec::with_capacity(array.len());
+    for item in array {
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("source missing 'name'"))?
+            .to_owned();
+        let registry = item
+            .get("registry")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("source missing 'registry'"))?;
+        let token = item
+            .get("token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("source missing 'token'"))?;
+        let service = item
+            .get("service")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("source missing 'service'"))?
+            .to_owned();
+        validate_https(registry)?;
+        validate_https(token)?;
         out.push(SourceSpec {
-            name: ts.name,
-            registry_url: ts.registry,
-            token_url: ts.token,
-            token_service: ts.service,
+            name,
+            registry_url: registry.to_owned(),
+            token_url: token.to_owned(),
+            token_service: service,
         });
     }
     if out.is_empty() {

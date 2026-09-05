@@ -1339,7 +1339,6 @@ dependencies = [
 name = "web-proxy"
 version = "0.1.0"
 dependencies = [
- "serde",
  "anyhow",
  "axum",
  "futures-util",

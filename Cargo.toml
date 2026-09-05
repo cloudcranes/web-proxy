@@ -10,7 +10,6 @@ futures-util = "0.3"
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 ring = "0.17"
-serde = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "fs", "io-util", "sync"] }
 tower = { version = "0.5", features = ["limit"] }
