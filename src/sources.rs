@@ -434,7 +434,7 @@ mod tests {
         let client = reqwest::Client::new();
         let pool = SourcePool::new(client, specs);
         pool.report_success(0).await;
-        pool.report_success(0).await;
+        pool.report_success(1).await;
         pool.report_failure(0).await;
         let snap = pool.weights_snapshot().await;
         assert!(
