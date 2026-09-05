@@ -104,6 +104,7 @@ struct AppState {
     ghcr: RegistryConfig,
     allowed_registry_hosts: HashSet<String>,
     public_origin: Option<String>,
+    default_scheme: &'static str,
     max_redirects: usize,
     cache: Arc<DiskCache>,
     manifests: Arc<ManifestCache>,
@@ -211,6 +212,13 @@ async fn main() -> Result<()> {
     )?;
     let sources = sources::SourcePool::new(client.clone(), source_specs);
 
+    let tls_acceptor = load_tls_acceptor()?;
+    let default_scheme: &'static str = if tls_acceptor.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+
     let state = Arc::new(AppState {
         client,
         sources,
@@ -218,6 +226,7 @@ async fn main() -> Result<()> {
         ghcr,
         allowed_registry_hosts,
         public_origin,
+        default_scheme,
         max_redirects,
         cache: Arc::new(cache),
         manifests: Arc::new(manifests),
@@ -241,7 +250,6 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
 
-    let tls_acceptor = load_tls_acceptor()?;
     if let Some(acceptor) = tls_acceptor {
         info!(%listen_addr, "listening (TLS)");
         serve_tls(listener, app, acceptor, drain_timeout).await?;
@@ -1374,7 +1382,7 @@ fn origin_for(state: &AppState, host: &str) -> String {
     state
         .public_origin
         .clone()
-        .unwrap_or_else(|| format!("http://{host}"))
+        .unwrap_or_else(|| format!("{}://{host}", state.default_scheme))
 }
 
 fn registry_challenge(origin: &str, scope: Option<&str>) -> Result<HeaderValue> {
