@@ -579,20 +579,14 @@ async fn proxy_token(
         url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect();
-    let scopes: Vec<&str> = pairs
+    let raw_scopes: Vec<&str> = pairs
         .iter()
         .filter(|(key, _)| key == "scope")
         .map(|(_, value)| value.as_str())
         .collect();
-    if scopes.len() > 1 {
-        return (StatusCode::BAD_REQUEST, "exactly one scope is required\n").into_response();
-    }
-    let (registry, upstream_scope) = match scopes.first() {
-        Some(scope) => match rewrite_scope(scope) {
-            Ok(value) => value,
-            Err(status) => return status.into_response(),
-        },
-        None => (Registry::DockerHub, String::new()),
+    let (registry, upstream_scope) = match merged_upstream_scope(&raw_scopes) {
+        Ok(value) => value,
+        Err(status) => return status.into_response(),
     };
     let config = registry.config(state);
 
@@ -1421,6 +1415,24 @@ fn classify_registry_path(path: &str) -> RegistryKind {
     }
 }
 
+// Docker's registry-mirrors mode may send the same repository twice (once
+// docker.io-prefixed, once bare). Spec-wise multiple scope params are a
+// union, so rewrite each, dedup, and merge into one upstream scope.
+fn merged_upstream_scope(
+    raw_scopes: &[&str],
+) -> std::result::Result<(Registry, String), StatusCode> {
+    let mut registry = Registry::DockerHub;
+    let mut merged: Vec<String> = Vec::new();
+    for scope in raw_scopes {
+        let (scope_registry, upstream_scope) = rewrite_scope(scope)?;
+        registry = scope_registry;
+        if !upstream_scope.is_empty() && !merged.contains(&upstream_scope) {
+            merged.push(upstream_scope);
+        }
+    }
+    Ok((registry, merged.join(" ")))
+}
+
 fn rewrite_scope(scope: &str) -> std::result::Result<(Registry, String), StatusCode> {
     let mut parts = scope.splitn(3, ':');
     if parts.next() != Some("repository") {
@@ -1831,5 +1843,45 @@ mod tests {
     fn private_key_from_pem_rejects_unknown() {
         let pem = "-----BEGIN SOMETHING-----\nYWJjZA==\n-----END SOMETHING-----\n";
         assert!(private_key_from_pem(pem, "test.pem").is_err());
+    }
+
+    #[test]
+    fn merges_duplicate_mirror_scopes() {
+        // Mirror mode: daemon sends the docker.io-prefixed scope and the bare one.
+        assert_eq!(
+            merged_upstream_scope(&[
+                "repository:docker.io/library/alpine:pull",
+                "repository:library/alpine:pull",
+            ])
+            .unwrap(),
+            (
+                Registry::DockerHub,
+                "repository:library/alpine:pull".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn merges_distinct_scopes_into_union() {
+        assert_eq!(
+            merged_upstream_scope(&[
+                "repository:library/alpine:pull",
+                "repository:library/busybox:pull",
+            ])
+            .unwrap(),
+            (
+                Registry::DockerHub,
+                "repository:library/alpine:pull repository:library/busybox:pull".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn merged_scopes_empty_and_invalid() {
+        assert_eq!(
+            merged_upstream_scope(&[]).unwrap(),
+            (Registry::DockerHub, String::new())
+        );
+        assert!(merged_upstream_scope(&["repository:../evil:pull"]).is_err());
     }
 }
