@@ -1,5 +1,6 @@
 mod cache;
 mod chunks;
+mod dockerpull;
 mod sources;
 
 use std::{
@@ -109,6 +110,7 @@ struct AppState {
     cache: Arc<DiskCache>,
     manifests: Arc<ManifestCache>,
     stats: Arc<Stats>,
+    pulls: Arc<dockerpull::PullManager>,
     started: Instant,
 }
 
@@ -232,6 +234,7 @@ async fn main() -> Result<()> {
         cache: Arc::new(cache),
         manifests: Arc::new(manifests),
         stats: Arc::new(Stats::default()),
+        pulls: dockerpull::PullManager::new(env_or("DOCKER_SOCKET", "/var/run/docker.sock")),
         started: Instant::now(),
     });
 
@@ -240,6 +243,8 @@ async fn main() -> Result<()> {
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
         .route("/downloads", get(downloads))
+        .route("/pull", post(start_pull))
+        .route("/pulls", get(list_pulls))
         .route("/sources", get(sources_view))
         .route("/sources/probe", post(trigger_probe))
         .route("/cache/clear", post(clear_cache))
@@ -481,6 +486,50 @@ async fn downloads(State(state): State<Arc<AppState>>) -> Response {
 
 async fn dashboard_redirect() -> Response {
     Redirect::temporary("/dashboard").into_response()
+}
+
+async fn start_pull(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if request.method() != Method::POST {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    // The daemon must reach us to pull, so reuse the caller's Host header.
+    let gateway_host = request
+        .headers()
+        .get(HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("127.0.0.1")
+        .to_owned();
+    let bytes = match request.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid body\n").into_response(),
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return (StatusCode::BAD_REQUEST, "expected json body\n").into_response();
+    };
+    let Some(image) = value.get("image").and_then(|i| i.as_str()) else {
+        return (StatusCode::BAD_REQUEST, "missing \"image\" field\n").into_response();
+    };
+    let spec = match dockerpull::plan_pull(image, &gateway_host) {
+        Ok(spec) => spec,
+        Err(error) => return (StatusCode::BAD_REQUEST, format!("{error}\n")).into_response(),
+    };
+    match state.pulls.start(spec).await {
+        Ok(job) => (
+            [(CONTENT_TYPE, "application/json")],
+            serde_json::json!({"id": job.id, "image": job.spec.image}).to_string(),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}\n")).into_response(),
+    }
+}
+
+async fn list_pulls(State(state): State<Arc<AppState>>) -> Response {
+    let rows = state.pulls.snapshot().await;
+    (
+        [(CONTENT_TYPE, "application/json")],
+        serde_json::json!(rows).to_string(),
+    )
+        .into_response()
 }
 
 async fn sources_view(State(state): State<Arc<AppState>>) -> Response {

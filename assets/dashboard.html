@@ -36,6 +36,21 @@
     .badge { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: .72rem; }
     .badge.resume { background: #3a2f14; color: var(--warn); }
     .badge.live { background: #14301f; color: var(--ok); }
+    .badge.done { background: #14301f; color: var(--ok); }
+    .badge.pulling { background: #14253a; color: var(--accent); }
+    .badge.retagging { background: #2a2340; color: #b39ddb; }
+    .badge.failed { background: #3a1414; color: var(--bad); }
+    .pulljob { border: 1px solid var(--line); border-radius: 6px; padding: .6rem .8rem; margin-bottom: .6rem; }
+    .pulljob .row { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+    .pulljob .name { font-size: .95rem; }
+    .pulljob .dbar { flex: 1; min-width: 140px; }
+    .layers { max-height: 170px; overflow-y: auto; margin-top: .5rem; border-top: 1px dashed var(--line); }
+    .layers .lrow { display: flex; align-items: center; gap: .6rem; padding: 2px 0; font-size: .78rem; }
+    .layers .lid { width: 90px; color: var(--muted); }
+    .layers .lbar { flex: 1; height: 5px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
+    .layers .lbar > div { height: 100%; background: var(--accent); }
+    .layers .lpct { width: 110px; text-align: right; color: var(--muted); }
+    .err { color: var(--bad); font-size: .8rem; margin-top: .3rem; white-space: pre-wrap; }
     button {
       font: inherit; padding: 5px 14px; margin-right: .6rem; cursor: pointer; color: var(--fg);
       border: 1px solid var(--line); background: var(--panel2); border-radius: 5px;
@@ -63,6 +78,17 @@
   </div>
 
   <section>
+    <h2>镜像拉取（经本网关加速，完成后自动重命名为原始名称）</h2>
+    <div style="display:flex; gap:.5rem; margin-bottom:.8rem; flex-wrap:wrap;">
+      <input id="pull-input" placeholder="例如 redis:alpine、bitnami/wordpress、ghcr.io/owner/img:tag"
+             style="flex:1; min-width:260px; font:inherit; padding:6px 10px; color:var(--fg);
+                    background:var(--panel2); border:1px solid var(--line); border-radius:5px;">
+      <button id="btn-pull" onclick="doPull()">拉取</button>
+    </div>
+    <div id="pulls"></div>
+  </section>
+
+  <section>
     <h2>进行中的下载（分块进度）</h2>
     <table id="downloads">
       <tr><th>仓库 / 路径</th><th>digest</th><th>进度</th><th>已传输</th><th>分块</th><th>耗时</th><th>来源</th></tr>
@@ -84,7 +110,7 @@
   </section>
 
   <footer>
-    API：<code>/stats</code> · <code>/downloads</code> · <code>/sources</code> · <code>POST /sources/probe</code> · <code>POST /cache/clear</code> · <code>/healthz</code>
+    API：<code>/pull</code> · <code>/pulls</code> · <code>/stats</code> · <code>/downloads</code> · <code>/sources</code> · <code>POST /sources/probe</code> · <code>POST /cache/clear</code> · <code>/healthz</code>
   </footer>
 
   <script>
@@ -189,8 +215,56 @@
         });
       }).catch(() => {});
     }
-    loadStats(); loadDownloads(); loadSources();
+    async function doPull() {
+      const input = document.getElementById('pull-input');
+      const btn = document.getElementById('btn-pull');
+      const image = input.value.trim();
+      if (!image) return;
+      btn.disabled = true;
+      try {
+        const r = await fetch('/pull', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok) { say('已加入拉取队列: ' + (j.image || image)); input.value = ''; loadPulls(); }
+        else say('拉取请求失败: ' + (j.error || j.message || ('HTTP ' + r.status) || JSON.stringify(j)), true);
+      } catch (e) { say('拉取请求失败: ' + e, true); }
+      finally { btn.disabled = false; }
+    }
+    const STATUS_BADGE = { pulling: 'pulling', retagging: 'retagging', done: 'done', failed: 'failed' };
+    function loadPulls() {
+      fetch('/pulls').then(r => r.json()).then(rows => {
+        const box = document.getElementById('pulls');
+        if (!rows.length) { box.innerHTML = '<span class="muted" style="font-size:.8rem">暂无拉取任务</span>'; return; }
+        box.innerHTML = '';
+        rows.forEach(job => {
+          const div = document.createElement('div');
+          div.className = 'pulljob';
+          const layers = (job.layers || []).map(l => {
+            const pct = l.total ? Math.min(100, l.current * 100 / l.total) : (l.status.includes('complete') || l.status.includes('Exists') ? 100 : 0);
+            return '<div class="lrow"><span class="lid">' + l.id + '</span>' +
+                   '<div class="lbar"><div style="width:' + pct + '%"></div></div>' +
+                   '<span class="lpct">' + l.status + (l.total ? ' ' + fmtBytes(l.current) + '/' + fmtBytes(l.total) : '') + '</span></div>';
+          }).join('');
+          div.innerHTML =
+            '<div class="row">' +
+              '<span class="name">' + job.image + '</span>' +
+              '<span class="badge ' + (STATUS_BADGE[job.status] || 'pulling') + '">' + job.status + '</span>' +
+              '<div class="dbar"><div style="width:' + (job.percent || 0) + '%"></div></div>' +
+              '<span class="muted">' + (job.percent || 0) + '% · ' + fmtDur(job.elapsed_secs) + '</span>' +
+            '</div>' +
+            (job.message ? '<div class="muted" style="font-size:.78rem;margin-top:.25rem">' + job.message + '</div>' : '') +
+            (job.error ? '<div class="err">' + job.error + '</div>' : '') +
+            (layers ? '<div class="layers">' + layers + '</div>' : '');
+          box.appendChild(div);
+        });
+      }).catch(() => {});
+    }
+    loadStats(); loadPulls(); loadDownloads(); loadSources();
     setInterval(loadStats, 5000);
+    setInterval(loadPulls, 2000);
     setInterval(loadDownloads, 2000);
     setInterval(loadSources, 5000);
   </script>

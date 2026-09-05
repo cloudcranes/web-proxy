@@ -13,7 +13,8 @@
 - **LRU 容量淘汰**：`CACHE_MAX_GB` 超限后按 mtime 淘汰最旧 blob（90% 水位）
 - **GHCR 代理**：`/v2/ghcr.io/...` 路径前缀模式（镜像 tag 改写为 `gateway:20516/ghcr.io/owner/img`）
 - **GitHub 加速**：9 个白名单域名透传（release/raw/codeload/api，git clone 支持）
-- **管理面板与 API**：`/dashboard` 交互面板；`/stats` 缓存指标；`GET /sources` 源权重与测速；`POST /sources/probe` 触发探测；`POST /cache/clear` 清空 blob 缓存
+- **管理面板与 API**：`/dashboard` 交互面板；`/stats` 缓存指标；`/downloads` 进行中的分块下载；`GET /sources` 源权重与测速；`POST /sources/probe` 触发探测；`POST /cache/clear` 清空 blob 缓存
+- **镜像拉取工具（类 KSpeeder）**：面板输入镜像名 → 守护进程经本网关拉取（自动吃到多源竞速+缓存）→ 实时展示每层进度 → 完成后自动重命名回原始名称（`POST /pull` + `GET /pulls`）。需把 `/var/run/docker.sock` 挂入容器并 `group_add` docker 组 GID（见 compose.yaml 注释）；仅支持 docker.io / ghcr.io，私有仓库需先 `docker login`
 - **可选 TLS 监听**：设置 `TLS_CERT_PATH` + `TLS_KEY_PATH` 后 `LISTEN_ADDR` 变为 HTTPS 端口
 - **安全**：出站仅限白名单域名（上游 + 重定向 CDN），拒绝 IP 字面量/非 443/路径穿越
 

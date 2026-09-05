@@ -9,6 +9,12 @@ services:
       - "20516:20516"
     volumes:
       - blob-cache:/data
+      # Pull-as-a-service: the gateway asks the local daemon to pull images
+      # through it. DOCKER_GID must be the host docker group gid
+      # (`stat -c %g /var/run/docker.sock`).
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"
     env_file:
       - .env
     read_only: true
