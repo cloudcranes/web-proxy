@@ -230,10 +230,11 @@ pub async fn download(
                 .with_context(|| format!("read {} bytes at {}", chunk.length, chunk.offset))?;
             Bytes::from(buf)
         };
-        hasher.update(&bytes);
         ordered[chunk.index] = Some(bytes);
 
-        // Emit any contiguous prefix to the client
+        // Emit any contiguous prefix to the client; hash here too, because
+        // emission walks offsets in blob order while chunk tasks complete in
+        // whatever order the network delivers them.
         while next_offset < total_size {
             let next_index = (next_offset / CHUNK_BYTES) as usize;
             if next_index >= chunks_total {
@@ -241,6 +242,7 @@ pub async fn download(
             }
             match ordered[next_index].take() {
                 Some(bytes) => {
+                    hasher.update(&bytes);
                     next_offset += bytes.len() as u64;
                     let mut client_disconnected = false;
                     if let Some(sender) = tx.as_ref() {
