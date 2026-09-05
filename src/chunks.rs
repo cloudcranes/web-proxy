@@ -12,12 +12,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tracing::warn;
 use url::Url;
 
 use crate::cache::{DiskCache, Stats};

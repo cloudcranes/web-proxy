@@ -17,6 +17,7 @@ RUN mkdir -p src \
     && cargo build --release --locked \
     && rm -rf src target/release/deps/web_proxy*
 COPY src ./src
+COPY assets ./assets
 RUN cargo build --release --locked \
     && strip target/release/web-proxy
 
