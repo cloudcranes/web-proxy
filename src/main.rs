@@ -766,8 +766,11 @@ async fn proxy_blob(
     }
 
     // Single-flight: one download per digest, late arrivals re-check the cache.
+    // The guard is held inside the download task until it truly finishes
+    // (including post-disconnect seeding); releasing it when the streaming
+    // response returns would let late arrivals start duplicate downloads.
     let guard = state.cache.inflight_lock(&hex).await;
-    let _guard = guard.lock().await;
+    let flight_guard = guard.lock_owned().await;
     if let Some(hit) = state.cache.lookup(&hex).await {
         state.stats.blob_hits.fetch_add(1, Ordering::Relaxed);
         state
@@ -834,6 +837,7 @@ async fn proxy_blob(
                 hex.clone(),
                 digest_header,
                 upstream,
+                flight_guard,
             )
             .await;
         }
@@ -854,6 +858,7 @@ async fn proxy_blob(
     let client = state.client.clone();
     let tx_clone = tx.clone();
     tokio::spawn(async move {
+        let _flight_guard = flight_guard;
         let result = chunks::download(
             client,
             sources,
@@ -898,6 +903,7 @@ async fn single_source_blob_fallback(
     hex: String,
     digest_header: HeaderValue,
     upstream: reqwest::Response,
+    flight_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(
         BLOB_CHANNEL_DEPTH,
@@ -905,6 +911,7 @@ async fn single_source_blob_fallback(
     let cache = Arc::clone(&state.cache);
     let stats = Arc::clone(&state.stats);
     tokio::spawn(async move {
+        let _flight_guard = flight_guard;
         tee_blob_to_cache(upstream, tx, cache, stats, hex).await;
     });
     let _ = registry; // unused but kept for symmetry with the chunked path.

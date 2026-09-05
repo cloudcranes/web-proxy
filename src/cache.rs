@@ -17,8 +17,6 @@ const PART_MAX_AGE: Duration = Duration::from_secs(3600);
 const EVICT_TARGET_NUM: u64 = 9;
 const EVICT_TARGET_DEN: u64 = 10;
 
-static PART_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Default)]
 pub struct Stats {
     pub blob_hits: AtomicU64,
@@ -94,12 +92,14 @@ impl DiskCache {
         })
     }
 
+    /// Deterministic per digest so a restarted process (or a retried request)
+    /// rediscovers the previous attempt's `.part` + `.bitmap` sidecar and can
+    /// resume; single-flight per digest guarantees a sole writer.
     pub fn new_part_path(&self, hex: &str) -> PathBuf {
-        let n = PART_COUNTER.fetch_add(1, Ordering::Relaxed);
         self.root
             .join("sha256")
             .join(&hex[..2])
-            .join(format!(".{hex}.{n}.part"))
+            .join(format!(".{hex}.part"))
     }
 
     /// One download per digest, regardless of which repo referenced it.
@@ -228,5 +228,33 @@ impl ManifestCache {
     pub async fn clear(&self) {
         let mut map = self.entries.lock().await;
         map.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn part_path_is_deterministic_per_digest() {
+        let cache = DiskCache::new(std::env::temp_dir().join("wp-part-path-test"), 1024);
+        let hex = "a".repeat(64);
+        let first = cache.new_part_path(&hex);
+        let second = cache.new_part_path(&hex);
+        // Same path across attempts is what makes the bitmap sidecar (and
+        // therefore resume after a restart) work at all.
+        assert_eq!(first, second);
+        assert!(first.to_string_lossy().ends_with(&format!(".{hex}.part")));
+        let components: Vec<String> = first
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            components
+                .windows(2)
+                .find(|pair| pair[0] == "sha256")
+                .map(|pair| pair[1].as_str()),
+            Some("aa")
+        );
     }
 }
