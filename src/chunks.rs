@@ -110,7 +110,7 @@ pub async fn download(
                     }
                 };
                 match fetch_chunk(
-                    client,
+                    &client,
                     &url,
                     &token,
                     chunk.offset,
