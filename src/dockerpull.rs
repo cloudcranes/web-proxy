@@ -273,6 +273,8 @@ async fn apply_progress_line(job: &PullJob, line: &[u8]) -> Result<()> {
 #[cfg(unix)]
 async fn docker_pull(socket: &str, job: &PullJob) -> Result<String> {
     use http_body_util::BodyExt;
+    use hyper::client::conn::http1;
+    use hyper_util::rt::TokioIo;
 
     let stream = tokio::net::UnixStream::connect(socket)
         .await
@@ -335,6 +337,8 @@ async fn docker_pull(socket: &str, job: &PullJob) -> Result<String> {
 #[cfg(unix)]
 async fn docker_retag(socket: &str, job: &PullJob) -> Result<()> {
     use http_body_util::BodyExt;
+    use hyper::client::conn::http1;
+    use hyper_util::rt::TokioIo;
 
     let repo = job
         .spec
