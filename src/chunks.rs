@@ -62,7 +62,7 @@ pub async fn download(
     total_size: u64,
     part_path: PathBuf,
     final_path: PathBuf,
-    tx: Option<mpsc::Sender<Result<Bytes>>>,
+    tx: Option<mpsc::Sender<Result<Bytes, std::io::Error>>>,
 ) -> Result<String> {
     let chunks = split(total_size);
     let dir = part_path
@@ -173,7 +173,11 @@ pub async fn download(
         ordered[slot_index as usize] = Some(bytes);
 
         // Emit any contiguous prefix to the client.
-        while let Some(next_index) = (next_offset / CHUNK_BYTES) as usize {
+        while next_offset < total_size {
+            let next_index = (next_offset / CHUNK_BYTES) as usize;
+            if next_index >= chunks_total {
+                break;
+            }
             match ordered[next_index].take() {
                 Some(bytes) => {
                     next_offset += bytes.len() as u64;

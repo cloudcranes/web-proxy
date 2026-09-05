@@ -31,7 +31,7 @@ pub struct SourceSpec {
     pub token_service: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SourceStats {
     pub success: u64,
     pub failure: u64,
