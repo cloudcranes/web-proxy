@@ -78,6 +78,33 @@
   </div>
 
   <section>
+    <h2>GitHub 加速（白名单域名透传：git clone / raw / releases / codeload）</h2>
+    <div style="display:flex; gap:.5rem; margin-bottom:.6rem; flex-wrap:wrap;">
+      <input id="gh-input" placeholder="粘贴 GitHub 链接，例如 https://github.com/owner/repo 或 raw / releases 下载链接"
+             onkeydown="if (event.key === 'Enter') convertGh()"
+             style="flex:1; min-width:260px; font:inherit; padding:6px 10px; color:var(--fg);
+                    background:var(--panel2); border:1px solid var(--line); border-radius:5px;">
+      <button id="btn-gh" onclick="convertGh()">生成加速链接</button>
+    </div>
+    <div id="gh-out" style="display:none">
+      <div style="display:flex; align-items:center; gap:.5rem; margin-bottom:.3rem;">
+        <span class="badge pulling">加速地址</span>
+        <code id="gh-url" style="flex:1; word-break:break-all; font-size:.82rem;"></code>
+        <button style="margin:0; padding:2px 10px;" onclick="copyEl('gh-url')">复制</button>
+      </div>
+      <div id="gh-gitrow" style="display:none; align-items:center; gap:.5rem;">
+        <span class="badge done">git clone</span>
+        <code id="gh-git" style="flex:1; word-break:break-all; font-size:.82rem;"></code>
+        <button style="margin:0; padding:2px 10px;" onclick="copyEl('gh-git')">复制</button>
+      </div>
+      <div id="gh-err" class="err" style="display:none"></div>
+    </div>
+    <div class="muted" style="font-size:.72rem; margin-top:.5rem;">
+      支持域名：github.com · api.github.com · raw.githubusercontent.com · codeload.github.com · gist.github.com · gist.githubusercontent.com · objects.githubusercontent.com · release-assets.githubusercontent.com · pkg-containers.githubusercontent.com
+    </div>
+  </section>
+
+  <section>
     <h2>镜像拉取（经本网关加速，完成后自动重命名为原始名称）</h2>
     <div style="display:flex; gap:.5rem; margin-bottom:.8rem; flex-wrap:wrap;">
       <input id="pull-input" placeholder="例如 redis:alpine、bitnami/wordpress、ghcr.io/owner/img:tag"
@@ -214,6 +241,39 @@
           tb.appendChild(tr);
         });
       }).catch(() => {});
+    }
+    const GH_HOSTS = ['github.com','api.github.com','raw.githubusercontent.com','codeload.github.com','gist.github.com','gist.githubusercontent.com','objects.githubusercontent.com','release-assets.githubusercontent.com','pkg-containers.githubusercontent.com'];
+    function copyEl(id) {
+      navigator.clipboard.writeText(document.getElementById(id).textContent)
+        .then(() => say('已复制'))
+        .catch(() => say('复制失败', true));
+    }
+    function convertGh() {
+      const raw = document.getElementById('gh-input').value.trim();
+      const out = document.getElementById('gh-out');
+      const err = document.getElementById('gh-err');
+      const gitrow = document.getElementById('gh-gitrow');
+      out.style.display = 'block';
+      err.style.display = 'none';
+      gitrow.style.display = 'none';
+      if (!raw) { err.textContent = '请先粘贴链接'; err.style.display = 'block'; return; }
+      let url;
+      try { url = new URL(/^https?:\/\//i.test(raw) ? raw : 'https://' + raw); }
+      catch (e) { err.textContent = '无法解析的链接'; err.style.display = 'block'; return; }
+      if (!GH_HOSTS.includes(url.hostname.toLowerCase())) {
+        err.textContent = '不支持 ' + url.hostname + '（仅白名单内 GitHub 域名）';
+        err.style.display = 'block';
+        return;
+      }
+      const accel = location.origin + '/' + url.hostname + url.pathname + url.search;
+      document.getElementById('gh-url').textContent = accel;
+      // 仓库主链接额外给 git clone 命令（tree/blob 子路径没有 clone 意义）
+      const m = url.pathname.match(/^\/([^/]+)\/([^/]+?)\/?$/);
+      if (url.hostname === 'github.com' && m) {
+        document.getElementById('gh-git').textContent =
+          'git clone ' + location.origin + '/github.com/' + m[1] + '/' + m[2] + '.git';
+        gitrow.style.display = 'flex';
+      }
     }
     async function doPull() {
       const input = document.getElementById('pull-input');

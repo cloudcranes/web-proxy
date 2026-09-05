@@ -80,7 +80,14 @@ GHCR / GitHub 走路径前缀：
 
 ```bash
 docker pull 192.168.1.107:20516/ghcr.io/owner/image:tag   # 需同样加入 insecure-registries
-git clone http://192.168.1.107:20516/github.com/owner/repo.git
+```
+
+GitHub 加速（9 域名白名单透传，域名拼在网关后即可，git/浏览器需信任自签 CA 或 `GIT_SSL_NO_VERIFY=1`）：
+
+```bash
+git clone https://192.168.1.107:20516/github.com/owner/repo.git
+curl -LO https://192.168.1.107:20516/github.com/owner/repo/releases/download/v1.0/app.tgz
+curl https://192.168.1.107:20516/raw.githubusercontent.com/owner/repo/main/README.md
 ```
 
 ## 开发
