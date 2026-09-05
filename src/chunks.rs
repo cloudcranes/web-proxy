@@ -13,9 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use axum::body::Bytes;
+use futures_util::StreamExt;
 use reqwest::Client;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use url::Url;
 
@@ -143,16 +144,14 @@ pub async fn download(
 
     while chunks_remaining > 0 {
         // Reap whichever task finishes next.
-        let (result, index) = futures_util::future::select_all(handles.iter_mut().map(|h| {
-            Box::pin(async {
-                let outcome = h.await.expect("join task");
-                (outcome, 0usize) // index injected below via map
-            })
-                as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = (Result<Chunk>, usize)> + Send>,
-                >
-        }))
-        .await;
+        let ((result, _index), _, _) =
+            futures_util::future::select_all(handles.iter_mut().map(|h| {
+                Box::pin(async move {
+                    let outcome = h.await.expect("join task");
+                    (outcome, 0usize)
+                })
+            }))
+            .await;
         let chunk = match result {
             Ok(chunk) => chunk,
             Err(error) => return Err(error.context("a chunk fetch exhausted retries")),
@@ -170,7 +169,7 @@ pub async fn download(
             Bytes::from(buf)
         };
         hasher.update(&bytes);
-        let slot_index = chunk.offset / CHUNK_BYTES;
+        let slot_index = (chunk.offset / CHUNK_BYTES) as usize;
         ordered[slot_index as usize] = Some(bytes);
 
         // Emit any contiguous prefix to the client.
@@ -254,6 +253,7 @@ async fn fetch_chunk(
     let mut stream = response.bytes_stream();
     let mut cursor = offset;
     let mut local_total = 0u64;
+    futures_util::pin_mut!(stream);
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(|e| anyhow::anyhow!("chunk {offset} read: {e}"))?;
         {

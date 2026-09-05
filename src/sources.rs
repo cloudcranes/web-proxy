@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
+use serde::Deserialize;
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -30,13 +31,13 @@ pub struct SourceSpec {
     pub token_service: String,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct SourceStats {
-    success: u64,
-    failure: u64,
-    p50_ms: u32,
-    range_ok: bool,
-    last_seen: Option<Instant>,
+#[derive(Clone, Copy, Debug, Default, Clone, Copy, Debug, Default)]
+pub struct SourceStats {
+    pub success: u64,
+    pub failure: u64,
+    pub p50_ms: u32,
+    pub range_ok: bool,
+    pub last_seen: Option<Instant>,
 }
 
 impl SourceStats {
@@ -75,11 +76,11 @@ impl SourcePool {
         tokio::spawn(async move {
             seed.probe_all().await;
         });
-        let runner = Arc::clone(&pool);
+        let prober = Arc::clone(&pool);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(PROBE_INTERVAL).await;
-                runner.probe_all().await;
+                prober.probe_all().await;
             }
         });
         pool

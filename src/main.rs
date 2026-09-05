@@ -265,9 +265,6 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
 
 async fn sources_view(State(state): State<Arc<AppState>>) -> Response {
     let snapshot = state.sources.weights_snapshot().await;
-    let last_seen = |instant: Option<std::time::Instant>| -> Option<String> {
-        instant.and_then(|t| t.checked_duration_since(std::time::Instant::now()))
-    };
     let body = serde_json::json!(snapshot
         .iter()
         .map(|(name, weight, stats)| {
@@ -278,11 +275,7 @@ async fn sources_view(State(state): State<Arc<AppState>>) -> Response {
                 "success": stats.success,
                 "failure": stats.failure,
                 "range_ok": stats.range_ok,
-                // StatsSnapshot timestamps are relative; emit the Unix epoch
-                // of the start of the process as a coarse placeholder so the
-                // dashboard doesn't show a misleading "now". The prober
-                // refreshes every 30s anyway.
-                "last_seen": stats.last_seen.map(|_| "just now"),
+                "last_seen": stats.last_seen.is_some(),
             })
         })
         .collect::<Vec<_>>());
