@@ -670,8 +670,8 @@ async fn proxy_blob(
     let tx_clone = tx.clone();
     tokio::spawn(async move {
         let result = chunks::download(
-            &client,
-            &sources,
+            client,
+            sources,
             cache,
             stats,
             registry_label,
