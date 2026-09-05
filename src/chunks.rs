@@ -291,26 +291,53 @@ pub async fn download(
 
 async fn fetch_chunk(
     client: &Client,
-    url: &Url,
+    initial_url: &Url,
     token: &str,
     offset: u64,
     length: u64,
     file: &tokio::sync::Mutex<tokio::fs::File>,
     total_received: &std::sync::atomic::AtomicU64,
 ) -> Result<()> {
-    let response = tokio::time::timeout(
-        CHUNK_TIMEOUT,
-        client
-            .get(url.clone())
-            .bearer_auth(token)
-            .header(
-                reqwest::header::RANGE,
-                format!("bytes={}-{}", offset, offset + length - 1),
-            )
-            .send(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("chunk {offset} timed out after {CHUNK_TIMEOUT:?}"))??;
+    let mut current_url = initial_url.clone();
+    let mut use_auth = true;
+    let mut redirects = 0;
+    const MAX_REDIRECTS: usize = 5;
+
+    let response = loop {
+        let mut builder = client.get(current_url.clone()).header(
+            reqwest::header::RANGE,
+            format!("bytes={}-{}", offset, offset + length - 1),
+        );
+        if use_auth && !token.is_empty() {
+            builder = builder.bearer_auth(token);
+        }
+
+        let resp = tokio::time::timeout(CHUNK_TIMEOUT, builder.send())
+            .await
+            .map_err(|_| anyhow::anyhow!("chunk {offset} timed out after {CHUNK_TIMEOUT:?}"))??;
+
+        if resp.status().is_redirection() {
+            if redirects >= MAX_REDIRECTS {
+                bail!("chunk {offset} exceeded max redirects");
+            }
+            redirects += 1;
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow::anyhow!("missing Location header in redirect"))?;
+            let next_url = current_url.join(location)?;
+            if next_url.host_str() != current_url.host_str() {
+                // Cross-host redirect (e.g. to CDN): drop Bearer auth as S3/R2 signed URLs use query auth
+                use_auth = false;
+            }
+            current_url = next_url;
+            continue;
+        }
+
+        break resp;
+    };
+
     let status = response.status();
     if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
         total_received.fetch_add(0, Ordering::Relaxed);
