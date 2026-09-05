@@ -363,13 +363,14 @@ async fn serve_tls(
     acceptor: TlsAcceptor,
     drain_timeout: u64,
 ) -> Result<()> {
+    let mut conns: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _peer) = accepted.context("accept TLS connection")?;
                 let acceptor = acceptor.clone();
                 let app = app.clone();
-                tokio::spawn(async move {
+                conns.spawn(async move {
                     let tls = match acceptor.accept(stream).await {
                         Ok(tls) => tls,
                         Err(error) => {
@@ -380,9 +381,26 @@ async fn serve_tls(
                     serve_tls_conn(TokioIo::new(tls), app, drain_timeout).await;
                 });
             }
-            _ = shutdown_signal() => return Ok(()),
+            _ = shutdown_signal() => break,
         }
     }
+    // Mirror the HTTP path's drain: let in-flight blob transfers finish (or
+    // hit the shared drain deadline) instead of killing the runtime at once.
+    while let Some(joined) = tokio::select! {
+        joined = conns.join_next() => joined,
+        _ = drain_deadline(drain_timeout) => {
+            warn!(drain_timeout_secs = drain_timeout, "drain timeout exceeded; closing remaining connections");
+            conns.abort_all();
+            None
+        }
+    } {
+        if let Err(error) = joined {
+            if !error.is_cancelled() {
+                warn!(%error, "TLS connection task failed");
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn serve_tls_conn(

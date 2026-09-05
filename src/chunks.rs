@@ -386,6 +386,15 @@ async fn fetch_chunk(
         cursor += chunk.len() as u64;
         local_total += chunk.len() as u64;
     }
+    // tokio::fs::File buffers writes; a process kill would silently drop the
+    // buffered tail while the caller still marks the chunk done. Flushing
+    // here makes the bitmap entry truthful for a later resumed download.
+    {
+        let mut file = file.lock().await;
+        file.flush()
+            .await
+            .with_context(|| format!("flush chunk {offset}"))?;
+    }
     total_received.fetch_add(local_total, Ordering::Relaxed);
     Ok(())
 }
