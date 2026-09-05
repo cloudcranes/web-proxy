@@ -37,6 +37,9 @@ pub struct SourceStats {
     pub p50_ms: u32,
     pub range_ok: bool,
     pub last_seen: Option<Instant>,
+    /// EWMA of observed bulk throughput in bytes/sec from real chunk fetches
+    /// (0 = never measured).
+    pub throughput_bps: u64,
 }
 
 impl SourceStats {
@@ -151,6 +154,7 @@ impl SourcePool {
                         p50_ms: stats[i].p50_ms,
                         range_ok: stats[i].range_ok,
                         last_seen: stats[i].last_seen,
+                        throughput_bps: stats[i].throughput_bps,
                     },
                 )
             })
@@ -177,6 +181,35 @@ impl SourcePool {
             slot.success = slot.success.saturating_add(1);
             slot.last_seen = Some(Instant::now());
         }
+    }
+
+    /// Feed a real bulk-transfer measurement into the per-source throughput
+    /// EWMA. Drives the downloader's adaptive chunk plan.
+    pub async fn report_throughput(&self, index: usize, bytes: u64, elapsed: Duration) {
+        if bytes == 0 || elapsed.is_zero() {
+            return;
+        }
+        let sample_bps = ((bytes as u128 * 1_000_000) / elapsed.as_micros().max(1) as u128) as u64;
+        let mut stats = self.stats.write().await;
+        if let Some(slot) = stats.get_mut(index) {
+            slot.throughput_bps = if slot.throughput_bps == 0 {
+                sample_bps
+            } else {
+                // 30% weight on the newest chunk, so the plan tracks drift
+                // within a handful of chunks.
+                (slot.throughput_bps * 7 + sample_bps * 3) / 10
+            };
+            slot.last_seen = Some(Instant::now());
+        }
+    }
+
+    /// Adaptive chunk plan for the next download: (chunk_bytes,
+    /// max_concurrent_chunks), derived from measured aggregate throughput.
+    /// (8 MiB, 4) until real measurements exist.
+    pub async fn chunk_plan(&self) -> (u64, usize) {
+        let stats = self.stats.read().await;
+        let total_bps: u64 = stats.iter().map(|s| s.throughput_bps).sum();
+        chunk_plan_for(total_bps)
     }
 
     pub async fn trigger_probe(self: &Arc<Self>) {
@@ -249,6 +282,33 @@ impl SourcePool {
             }
         }
     }
+}
+
+/// Chunk-size bands and concurrency bounds for the adaptive downloader.
+/// Chunk size only steps in coarse bands so a resumed download (which must
+/// reuse the previous attempt's chunk size, recorded in the bitmap) is not
+/// invalidated by tiny throughput drift.
+pub const CHUNK_MIN_BYTES: u64 = 8 * 1024 * 1024;
+pub const CHUNK_MAX_BYTES: u64 = 32 * 1024 * 1024;
+pub const CONCURRENCY_MIN: usize = 4;
+pub const CONCURRENCY_MAX: usize = 16;
+/// Aim to keep roughly this much data in flight across all chunk streams.
+const TARGET_INFLIGHT_SECS: u64 = 2;
+
+pub fn chunk_plan_for(total_bps: u64) -> (u64, usize) {
+    if total_bps == 0 {
+        return (CHUNK_MIN_BYTES, CONCURRENCY_MIN);
+    }
+    let mib_per_sec = total_bps / (1024 * 1024);
+    let chunk_bytes = match mib_per_sec {
+        0..=49 => CHUNK_MIN_BYTES,
+        50..=149 => 16 * 1024 * 1024,
+        _ => CHUNK_MAX_BYTES,
+    };
+    let inflight = total_bps.saturating_mul(TARGET_INFLIGHT_SECS);
+    let concurrency = (((inflight + chunk_bytes - 1) / chunk_bytes) as usize)
+        .clamp(CONCURRENCY_MIN, CONCURRENCY_MAX);
+    (chunk_bytes, concurrency)
 }
 
 fn ewma_ms(prev: u32, sample: u32) -> u32 {

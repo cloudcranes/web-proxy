@@ -37,7 +37,7 @@
   </table>
 
   <table id="sources">
-    <tr><th>source</th><th>score</th><th>p50 ms</th><th>success / fail</th><th>range</th><th>last probe</th></tr>
+    <tr><th>source</th><th>score</th><th>p50 ms</th><th>throughput</th><th>success / fail</th><th>range</th><th>last probe</th></tr>
   </table>
 
   <div style="margin-bottom:1.5rem">
@@ -115,13 +115,15 @@
     function loadSources() {
       fetch('/sources').then(r => r.json()).then(rows => {
         const tb = document.getElementById('sources');
-        tb.innerHTML = '<tr><th>source</th><th>score</th><th>p50 ms</th><th>success / fail</th><th>range</th><th>last probe</th></tr>';
+        tb.innerHTML = '<tr><th>source</th><th>score</th><th>p50 ms</th><th>throughput</th><th>success / fail</th><th>range</th><th>last probe</th></tr>';
         rows.forEach(r => {
           const tr = document.createElement('tr');
+          const mbps = (r.throughput_bps / 1048576).toFixed(1);
           tr.innerHTML =
             '<td>' + r.name + '</td>' +
             '<td>' + r.weight.toFixed(3) + '</td>' +
             '<td>' + r.p50_ms + '</td>' +
+            '<td class="muted">' + (r.throughput_bps ? mbps + ' MiB/s' : '–') + '</td>' +
             '<td>' + r.success + ' / ' + r.failure + '</td>' +
             '<td class="' + (r.range_ok ? 'up' : 'down') + '">' + (r.range_ok ? 'yes' : 'no') + '</td>' +
             '<td class="muted">' + (r.last_seen ? 'recent' : '–') + '</td>';

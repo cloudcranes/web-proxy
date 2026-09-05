@@ -469,6 +469,7 @@ async fn sources_view(State(state): State<Arc<AppState>>) -> Response {
                 "success": stats.success,
                 "failure": stats.failure,
                 "range_ok": stats.range_ok,
+                "throughput_bps": stats.throughput_bps,
                 "last_seen": stats.last_seen.is_some(),
             })
         })

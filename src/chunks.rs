@@ -7,15 +7,17 @@
 //! the cache key.
 //!
 //! Resumable downloads:
-//! Alongside `<hex>.part`, a `<hex>.bitmap` sidecar stores 1 byte per chunk
-//! indicating completion (1 = written & verified, 0 = pending). If a prior
-//! download was cancelled mid-way, already-fetched chunks are reused directly
-//! from disk without touching upstream networks.
+//! Alongside `<hex>.part`, a `<hex>.bitmap` sidecar starts with an 8-byte
+//! little-endian header holding the chunk size this attempt used, followed by
+//! 1 byte per chunk (1 = written & verified, 0 = pending). A resumed attempt
+//! reuses the recorded chunk size so offsets line up; if a prior download was
+//! cancelled mid-way, already-fetched chunks are reused directly from disk
+//! without touching upstream networks.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
@@ -23,7 +25,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::cache::{DiskCache, Stats};
@@ -32,7 +34,6 @@ use crate::sources::SourcePool;
 pub const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_CHUNK_RETRIES: usize = 3;
-const MAX_CONCURRENT_CHUNKS: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Chunk {
@@ -42,14 +43,19 @@ pub struct Chunk {
 }
 
 pub fn split(total: u64) -> Vec<Chunk> {
+    split_with(total, CHUNK_BYTES)
+}
+
+pub fn split_with(total: u64, chunk_bytes: u64) -> Vec<Chunk> {
     if total == 0 {
         return Vec::new();
     }
-    let mut chunks = Vec::with_capacity((total / CHUNK_BYTES + 1) as usize);
+    let chunk_bytes = chunk_bytes.max(1);
+    let mut chunks = Vec::with_capacity((total / chunk_bytes + 1) as usize);
     let mut offset = 0;
     let mut index = 0;
     while offset < total {
-        let length = (total - offset).min(CHUNK_BYTES);
+        let length = (total - offset).min(chunk_bytes);
         chunks.push(Chunk {
             index,
             offset,
@@ -61,20 +67,32 @@ pub fn split(total: u64) -> Vec<Chunk> {
     chunks
 }
 
-/// Read existing bitmap sidecar if valid. Returns a boolean vector where
-/// true indicates the chunk was already written to the part file.
-async fn load_bitmap(bitmap_path: &Path, chunks_total: usize) -> Vec<bool> {
-    if let Ok(bytes) = tokio::fs::read(bitmap_path).await {
-        if bytes.len() == chunks_total {
-            return bytes.into_iter().map(|b| b == 1).collect();
-        }
-    }
-    vec![false; chunks_total]
+/// Existing bitmap sidecar: the chunk size it was written with plus per-chunk
+/// completion flags. `None` means "no usable sidecar" (absent, truncated, or
+/// zero header) and the download should start fresh.
+struct ExistingBitmap {
+    chunk_bytes: u64,
+    done: Vec<bool>,
 }
 
-/// Persist updated bitmap state.
-async fn save_bitmap(bitmap_path: &Path, state: &[bool]) {
-    let bytes: Vec<u8> = state.iter().map(|&b| if b { 1 } else { 0 }).collect();
+async fn load_bitmap(bitmap_path: &Path) -> Option<ExistingBitmap> {
+    let bytes = tokio::fs::read(bitmap_path).await.ok()?;
+    if bytes.len() < 8 {
+        return None;
+    }
+    let chunk_bytes = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+    if chunk_bytes == 0 {
+        return None;
+    }
+    let done: Vec<bool> = bytes[8..].iter().map(|&b| b == 1).collect();
+    Some(ExistingBitmap { chunk_bytes, done })
+}
+
+/// Persist updated bitmap state (v2: chunk-size header + completion flags).
+async fn save_bitmap(bitmap_path: &Path, chunk_bytes: u64, state: &[bool]) {
+    let mut bytes = Vec::with_capacity(8 + state.len());
+    bytes.extend_from_slice(&chunk_bytes.to_le_bytes());
+    bytes.extend(state.iter().map(|&b| if b { 1 } else { 0 }));
     let _ = tokio::fs::write(bitmap_path, &bytes).await;
 }
 
@@ -94,8 +112,6 @@ pub async fn download(
     final_path: PathBuf,
     mut tx: Option<mpsc::Sender<Result<Bytes, std::io::Error>>>,
 ) -> Result<String> {
-    let chunks = split(total_size);
-    let chunks_total = chunks.len();
     let bitmap_path = part_path.with_extension("bitmap");
 
     let dir = part_path
@@ -103,13 +119,34 @@ pub async fn download(
         .ok_or_else(|| anyhow::anyhow!("part path has no parent"))?;
     tokio::fs::create_dir_all(dir).await?;
 
-    let existing_bitmap = load_bitmap(&bitmap_path, chunks_total).await;
+    // Adaptive plan from measured source throughput. A usable sidecar pins
+    // the chunk size to whatever the interrupted attempt used so offsets and
+    // bitmap flags line up; concurrency is always free to adapt.
+    let (planned_chunk_bytes, max_concurrent) = pool.chunk_plan().await;
+    let existing = load_bitmap(&bitmap_path).await;
+    let (chunk_bytes, prior_flags) = match existing {
+        Some(bitmap) if bitmap.chunk_bytes > 0 => (bitmap.chunk_bytes, Some(bitmap.done)),
+        _ => (planned_chunk_bytes, None),
+    };
+
+    let chunks = split_with(total_size, chunk_bytes);
+    let chunks_total = chunks.len();
+    let existing_bitmap = match prior_flags {
+        Some(flags) if flags.len() == chunks_total => flags,
+        _ => vec![false; chunks_total],
+    };
     let resumed_count = existing_bitmap.iter().filter(|&&b| b).count();
     if resumed_count > 0 {
         info!(
             resumed = resumed_count,
             total = chunks_total,
             "resuming partial download from disk"
+        );
+    } else {
+        debug!(
+            chunk_mib = chunk_bytes / 1024 / 1024,
+            concurrency = max_concurrent,
+            "chunk plan"
         );
     }
 
@@ -123,7 +160,7 @@ pub async fn download(
 
     let shared = Arc::new(tokio::sync::Mutex::new(file));
     let total_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CHUNKS));
+    let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
 
     let mut tasks: tokio::task::JoinSet<anyhow::Result<(Chunk, bool)>> =
         tokio::task::JoinSet::new();
@@ -158,6 +195,7 @@ pub async fn download(
                         continue;
                     }
                 };
+                let started = Instant::now();
                 match fetch_chunk(
                     &client,
                     &url,
@@ -169,8 +207,10 @@ pub async fn download(
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(bytes) => {
                         pool.report_success(source_index).await;
+                        pool.report_throughput(source_index, bytes, started.elapsed())
+                            .await;
                         return Ok::<_, anyhow::Error>((chunk, false));
                     }
                     Err(error) => {
@@ -215,7 +255,7 @@ pub async fn download(
 
         if !from_cache {
             current_bitmap[chunk.index] = true;
-            save_bitmap(&bitmap_path, &current_bitmap).await;
+            save_bitmap(&bitmap_path, chunk_bytes, &current_bitmap).await;
         }
 
         // Read back bytes from disk file for hashing and ordered client streaming
@@ -302,7 +342,7 @@ async fn fetch_chunk(
     length: u64,
     file: &tokio::sync::Mutex<tokio::fs::File>,
     total_received: &std::sync::atomic::AtomicU64,
-) -> Result<()> {
+) -> Result<u64> {
     let mut current_url = initial_url.clone();
     let mut use_auth = true;
     let mut redirects = 0;
@@ -405,7 +445,7 @@ async fn fetch_chunk(
             .with_context(|| format!("flush chunk {offset}"))?;
     }
     total_received.fetch_add(local_total, Ordering::Relaxed);
-    Ok(())
+    Ok(local_total)
 }
 
 fn build_blob_url(registry_url: &str, path: &str) -> Result<Url> {
@@ -472,9 +512,63 @@ mod tests {
     async fn bitmap_persistence_round_trip() {
         let tmp = std::env::temp_dir().join("test_bitmap_persist.bitmap");
         let initial = vec![true, false, true, true];
-        save_bitmap(&tmp, &initial).await;
-        let loaded = load_bitmap(&tmp, 4).await;
-        assert_eq!(loaded, initial);
+        save_bitmap(&tmp, CHUNK_BYTES, &initial).await;
+        let loaded = load_bitmap(&tmp).await.expect("bitmap readable");
+        assert_eq!(loaded.chunk_bytes, CHUNK_BYTES);
+        assert_eq!(loaded.done, initial);
         let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn bitmap_rejects_truncated_and_zero_header() {
+        let tmp = std::env::temp_dir().join("test_bitmap_bad_header.bitmap");
+        tokio::fs::write(&tmp, [0u8; 4]).await.unwrap();
+        assert!(load_bitmap(&tmp).await.is_none());
+        let zero_header = {
+            let mut bytes = 0u64.to_le_bytes().to_vec();
+            bytes.push(1);
+            bytes
+        };
+        tokio::fs::write(&tmp, zero_header).await.unwrap();
+        assert!(load_bitmap(&tmp).await.is_none());
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    #[test]
+    fn split_with_uses_requested_chunk_size() {
+        let chunks = split_with(CHUNK_BYTES * 4, CHUNK_BYTES * 2);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].length, CHUNK_BYTES * 2);
+        assert_eq!(chunks[1].offset, CHUNK_BYTES * 2);
+    }
+
+    #[test]
+    fn chunk_plan_defaults_without_measurements() {
+        assert_eq!(
+            crate::sources::chunk_plan_for(0),
+            (
+                crate::sources::CHUNK_MIN_BYTES,
+                crate::sources::CONCURRENCY_MIN
+            )
+        );
+    }
+
+    #[test]
+    fn chunk_plan_scales_chunk_band_and_concurrency() {
+        // ~10 MiB/s: default chunk, min concurrency (ceil(20/8)=3 -> clamp 4).
+        assert_eq!(
+            crate::sources::chunk_plan_for(10 * 1024 * 1024),
+            (8 * 1024 * 1024, 4)
+        );
+        // ~60 MiB/s: 16 MiB chunks, ceil(120/16)=8 streams.
+        assert_eq!(
+            crate::sources::chunk_plan_for(60 * 1024 * 1024),
+            (16 * 1024 * 1024, 8)
+        );
+        // ~1 GiB/s: max chunk, concurrency clamped at 16.
+        assert_eq!(
+            crate::sources::chunk_plan_for(1024 * 1024 * 1024),
+            (32 * 1024 * 1024, crate::sources::CONCURRENCY_MAX)
+        );
     }
 }
