@@ -1,4 +1,6 @@
 mod cache;
+mod chunks;
+mod sources;
 
 use std::{
     collections::HashSet,
@@ -89,6 +91,7 @@ impl Registry {
 
 struct AppState {
     client: Client,
+    sources: Arc<sources::SourcePool>,
     dockerhub: RegistryConfig,
     ghcr: RegistryConfig,
     allowed_registry_hosts: HashSet<String>,
@@ -185,8 +188,24 @@ async fn main() -> Result<()> {
         allowed_registry_hosts.insert(host.to_ascii_lowercase());
     }
 
+    let source_specs = sources::load_or_default(
+        env::var("SOURCES_TOML").ok().as_deref(),
+        (
+            dockerhub.registry_url.clone(),
+            dockerhub.token_url.clone(),
+            dockerhub.token_service.clone(),
+        ),
+        (
+            ghcr.registry_url.clone(),
+            ghcr.token_url.clone(),
+            ghcr.token_service.clone(),
+        ),
+    )?;
+    let sources = sources::SourcePool::new(client.clone(), source_specs);
+
     let state = Arc::new(AppState {
         client,
+        sources,
         dockerhub,
         ghcr,
         allowed_registry_hosts,
@@ -200,6 +219,8 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
+        .route("/sources", get(sources_view))
+        .route("/dashboard", get(dashboard))
         .fallback(proxy)
         .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
         .layer(ConcurrencyLimitLayer::new(max_concurrent_requests))
@@ -240,6 +261,37 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
         "disk_cap_bytes": state.cache.max_bytes(),
     });
     ([(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
+async fn sources_view(State(state): State<Arc<AppState>>) -> Response {
+    let snapshot = state.sources.weights_snapshot().await;
+    let last_seen = |instant: Option<std::time::Instant>| -> Option<String> {
+        instant.and_then(|t| t.checked_duration_since(std::time::Instant::now()))
+    };
+    let body = serde_json::json!(snapshot
+        .iter()
+        .map(|(name, weight, stats)| {
+            serde_json::json!({
+                "name": name,
+                "weight": weight,
+                "p50_ms": stats.p50_ms,
+                "success": stats.success,
+                "failure": stats.failure,
+                "range_ok": stats.range_ok,
+                // StatsSnapshot timestamps are relative; emit the Unix epoch
+                // of the start of the process as a coarse placeholder so the
+                // dashboard doesn't show a misleading "now". The prober
+                // refreshes every 30s anyway.
+                "last_seen": stats.last_seen.map(|_| "just now"),
+            })
+        })
+        .collect::<Vec<_>>());
+    ([(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
+async fn dashboard() -> Response {
+    let body = include_str!("../assets/dashboard.html");
+    ([(CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
 }
 
 async fn proxy(
@@ -522,7 +574,7 @@ async fn proxy_blob(
         return passthrough_registry(state, registry, path, host, request).await;
     };
     if request.headers().contains_key(RANGE) {
-        // Ranged requests bypass the cache in M1; serve straight through.
+        // Ranged requests bypass the cache and the chunked downloader.
         return passthrough_registry(state, registry, path, host, request).await;
     }
 
@@ -580,14 +632,69 @@ async fn proxy_blob(
         Ok(value) => value,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
+
+    // Token broker call: single-source, mirrors the manifest path.
+    let token_broker = registry.config(state);
+    let token_url = match Url::parse(&token_broker.token_url) {
+        Ok(url) => url,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let token = match fetch_token_for(&state.client, &token_broker, &path).await {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+
+    let total_size = match content_length {
+        Some(len) => len,
+        None => {
+            // Chunked downloads need an explicit size. Fall back to the
+            // single-source streamer so the client still gets the blob.
+            return single_source_blob_fallback(
+                state,
+                registry,
+                path.clone(),
+                hex.clone(),
+                digest_header,
+                upstream,
+            )
+            .await;
+        }
+    };
+
+    let part_path = state.cache.new_part_path(&hex);
+    let final_path = state.cache.blob_path(&hex);
     let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(
         BLOB_CHANNEL_DEPTH,
     );
-    let cache = state.cache.clone();
-    let stats = state.stats.clone();
-    let hex_owned = hex.clone();
+
+    let sources = Arc::clone(&state.sources);
+    let cache = Arc::clone(&state.cache);
+    let stats = Arc::clone(&state.stats);
+    let path_for_task = path.clone();
+    let registry_label = registry.route_prefix().to_owned();
+    let hex_for_task = hex.clone();
+    let client = state.client.clone();
+    let tx_clone = tx.clone();
     tokio::spawn(async move {
-        tee_blob_to_cache(upstream, tx, cache, stats, hex_owned).await;
+        let result = chunks::download(
+            &client,
+            &sources,
+            cache,
+            stats,
+            registry_label,
+            path_for_task,
+            token,
+            digest.clone(),
+            total_size,
+            part_path,
+            final_path,
+            Some(tx_clone),
+        )
+        .await;
+        if let Err(error) = result {
+            warn!(error = %error, "chunked blob download failed");
+            let _ = tx.send(Err(std::io::Error::other(error))).await;
+        }
     });
 
     let mut builder = Response::builder()
@@ -596,16 +703,86 @@ async fn proxy_blob(
             CONTENT_TYPE,
             HeaderValue::from_static("application/octet-stream"),
         )
-        .header(&DOCKER_CONTENT_DIGEST_HEADER, digest_header);
-    if let Some(len) = content_length {
-        builder = builder.header(CONTENT_LENGTH, len);
-    }
+        .header(&DOCKER_CONTENT_DIGEST_HEADER, digest_header)
+        .header(CONTENT_LENGTH, total_size);
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
     });
     builder
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+async fn single_source_blob_fallback(
+    state: &AppState,
+    registry: Registry,
+    path: String,
+    hex: String,
+    digest_header: HeaderValue,
+    upstream: reqwest::Response,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(
+        BLOB_CHANNEL_DEPTH,
+    );
+    let cache = Arc::clone(&state.cache);
+    let stats = Arc::clone(&state.stats);
+    tokio::spawn(async move {
+        tee_blob_to_cache(upstream, tx, cache, stats, hex).await;
+    });
+    let _ = registry; // unused but kept for symmetry with the chunked path.
+    let _ = path;
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        )
+        .header(&DOCKER_CONTENT_DIGEST_HEADER, digest_header);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    builder
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+async fn fetch_token_for(
+    client: &reqwest::Client,
+    config: &RegistryConfig,
+    path: &str,
+) -> std::result::Result<String, Response> {
+    let scope = registry_repository(path).map(|repository| format!("repository:{repository}:pull"));
+    let mut url = match Url::parse(&config.token_url) {
+        Ok(url) => url,
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    };
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("service", &config.token_service);
+        if let Some(scope) = scope {
+            query.append_pair("scope", &scope);
+        }
+    }
+    let response = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(_) => return Err(StatusCode::BAD_GATEWAY.into_response()),
+    };
+    if !response.status().is_success() {
+        return Err(StatusCode::BAD_GATEWAY.into_response());
+    }
+    let body = match response.bytes().await {
+        Ok(b) => b,
+        Err(_) => return Err(StatusCode::BAD_GATEWAY.into_response()),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Err(StatusCode::BAD_GATEWAY.into_response()),
+    };
+    value
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| StatusCode::BAD_GATEWAY.into_response())
 }
 
 async fn tee_blob_to_cache(

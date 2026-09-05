@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>web-proxy dashboard</title>
+  <meta http-equiv="refresh" content="10">
+  <style>
+    body { font: 14px/1.4 ui-monospace, Menlo, Consolas, monospace; margin: 1.5rem; color: #1a1a1a; }
+    h1 { font-size: 1.2rem; margin: 0 0 1rem; }
+    table { border-collapse: collapse; margin-bottom: 1.5rem; }
+    th, td { padding: 4px 10px; text-align: left; border-bottom: 1px solid #ddd; }
+    th { background: #f5f5f5; }
+    .bar { background: #4a8bf5; height: 10px; display: inline-block; vertical-align: middle; }
+    .up { color: #1a7f37; }
+    .down { color: #c93c37; }
+    .muted { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>web-proxy</h1>
+  <table id="cache">
+    <tr><th colspan="2">cache</th></tr>
+    <tr><td>hits</td><td id="hits">–</td></tr>
+    <tr><td>misses</td><td id="misses">–</td></tr>
+    <tr><td>bytes from cache</td><td id="bc">–</td></tr>
+    <tr><td>bytes from upstream</td><td id="bu">–</td></tr>
+    <tr><td>disk bytes / cap</td><td id="disk">–</td></tr>
+    <tr><td>hit ratio</td><td id="ratio">–</td></tr>
+  </table>
+  <table id="sources">
+    <tr><th>source</th><th>score</th><th>p50 ms</th><th>success / fail</th><th>range</th><th>last probe</th></tr>
+  </table>
+  <p class="muted">auto-refresh every 10s · /stats exposes the same JSON</p>
+  <script>
+    function fmtBytes(n) {
+      if (n < 1024) return n + ' B';
+      const units = ['KB','MB','GB','TB'];
+      let v = n / 1024, i = 0;
+      while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+      return v.toFixed(1) + ' ' + units[i];
+    }
+    function ago(iso) {
+      if (!iso) return '–';
+      const ms = Date.now() - Date.parse(iso);
+      if (ms < 0) return 'just now';
+      if (ms < 60_000) return Math.floor(ms / 1000) + 's ago';
+      return Math.floor(ms / 60_000) + 'm ago';
+    }
+    fetch('/stats').then(r => r.json()).then(s => {
+      document.getElementById('hits').textContent = s.blob_cache_hits;
+      document.getElementById('misses').textContent = s.blob_cache_misses;
+      document.getElementById('bc').textContent = fmtBytes(s.bytes_from_cache);
+      document.getElementById('bu').textContent = fmtBytes(s.bytes_from_upstream);
+      const pct = s.disk_cap_bytes ? Math.min(100, s.disk_bytes * 100 / s.disk_cap_bytes) : 0;
+      document.getElementById('disk').innerHTML =
+        fmtBytes(s.disk_bytes) + ' / ' + fmtBytes(s.disk_cap_bytes) +
+        ' <span class="bar" style="width:' + pct + 'px"></span>';
+      const total = s.blob_cache_hits + s.blob_cache_misses;
+      document.getElementById('ratio').textContent =
+        total ? (s.blob_cache_hits * 100 / total).toFixed(1) + '%' : '–';
+    }).catch(e => document.getElementById('cache').innerHTML =
+      '<tr><td colspan="2" class="down">stats fetch failed: ' + e + '</td></tr>');
+    fetch('/sources').then(r => r.json()).then(rows => {
+      const tb = document.getElementById('sources');
+      rows.forEach(r => {
+        const tr = document.createElement('tr');
+        const score = Math.min(1, r.weight);
+        tr.innerHTML =
+          '<td>' + r.name + '</td>' +
+          '<td>' + score.toFixed(3) + '</td>' +
+          '<td>' + r.p50_ms + '</td>' +
+          '<td>' + r.success + ' / ' + r.failure + '</td>' +
+          '<td class="' + (r.range_ok ? 'up' : 'down') + '">' + (r.range_ok ? 'yes' : 'no') + '</td>' +
+          '<td class="muted">' + ago(r.last_seen) + '</td>';
+        tb.appendChild(tr);
+      });
+    }).catch(() => {});
+  </script>
+</body>
+</html>
