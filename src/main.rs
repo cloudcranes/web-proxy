@@ -24,7 +24,7 @@ use axum::{
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
     },
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use cache::{CachedBlob, DiskCache, ManifestCache, Stats};
@@ -220,6 +220,8 @@ async fn main() -> Result<()> {
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
         .route("/sources", get(sources_view))
+        .route("/sources/probe", post(trigger_probe))
+        .route("/cache/clear", post(clear_cache))
         .route("/dashboard", get(dashboard))
         .fallback(proxy)
         .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
@@ -279,6 +281,21 @@ async fn sources_view(State(state): State<Arc<AppState>>) -> Response {
             })
         })
         .collect::<Vec<_>>());
+    ([(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
+async fn trigger_probe(State(state): State<Arc<AppState>>) -> Response {
+    state.sources.trigger_probe().await;
+    StatusCode::ACCEPTED.into_response()
+}
+
+async fn clear_cache(State(state): State<Arc<AppState>>) -> Response {
+    let freed_bytes = state.cache.clear().await;
+    state.manifests.clear().await;
+    let body = serde_json::json!({
+        "status": "cleared",
+        "freed_bytes": freed_bytes,
+    });
     ([(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }
 
