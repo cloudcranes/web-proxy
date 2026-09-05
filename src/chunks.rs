@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::cache::{DiskCache, Stats};
+use crate::cache::{ActiveDownload, ActiveDownloadGuard, DiskCache, Stats};
 use crate::sources::SourcePool;
 
 pub const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
@@ -162,6 +162,23 @@ pub async fn download(
     let total_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
 
+    // Live progress for the dashboard; the guard removes the entry on any
+    // exit path (success, exhausted retries, client abort).
+    let download_guard = ActiveDownloadGuard::new(
+        Arc::clone(&stats),
+        ActiveDownload {
+            path: path.clone(),
+            digest: digest.clone(),
+            total: total_size,
+            chunks_total,
+            resumed: resumed_count > 0,
+            started: Instant::now(),
+            chunks_done: std::sync::atomic::AtomicU64::new(resumed_count as u64),
+            bytes_done: std::sync::atomic::AtomicU64::new(0),
+        },
+    );
+    let download_progress = download_guard.handle();
+
     let mut tasks: tokio::task::JoinSet<anyhow::Result<(Chunk, bool)>> =
         tokio::task::JoinSet::new();
     for chunk in &chunks {
@@ -276,7 +293,7 @@ pub async fn download(
         // emission walks offsets in blob order while chunk tasks complete in
         // whatever order the network delivers them.
         while next_offset < total_size {
-            let next_index = (next_offset / CHUNK_BYTES) as usize;
+            let next_index = (next_offset / chunk_bytes) as usize;
             if next_index >= chunks_total {
                 break;
             }
@@ -284,6 +301,12 @@ pub async fn download(
                 Some(bytes) => {
                     hasher.update(&bytes);
                     next_offset += bytes.len() as u64;
+                    download_progress
+                        .chunks_done
+                        .fetch_add(1, Ordering::Relaxed);
+                    download_progress
+                        .bytes_done
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     let mut client_disconnected = false;
                     if let Some(sender) = tx.as_ref() {
                         if sender.send(Ok(bytes)).await.is_err() {

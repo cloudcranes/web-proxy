@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::Mutex;
@@ -23,6 +24,68 @@ pub struct Stats {
     pub blob_misses: AtomicU64,
     pub bytes_from_cache: AtomicU64,
     pub bytes_from_upstream: AtomicU64,
+    /// In-flight chunked blob downloads, keyed by digest hex. The dashboard
+    /// polls this for live per-blob progress.
+    pub active_downloads: Mutex<HashMap<String, Arc<ActiveDownload>>>,
+}
+
+/// Live progress handle for one chunked blob download. Counters are updated
+/// by the download collector; the entry is removed when the download ends.
+pub struct ActiveDownload {
+    pub path: String,
+    pub digest: String,
+    pub total: u64,
+    pub chunks_total: usize,
+    pub resumed: bool,
+    pub started: Instant,
+    pub chunks_done: AtomicU64,
+    pub bytes_done: AtomicU64,
+}
+
+impl ActiveDownload {
+    pub fn progress_json(&self) -> serde_json::Value {
+        let chunks_done = self.chunks_done.load(Ordering::Relaxed);
+        serde_json::json!({
+            "path": self.path,
+            "digest": self.digest,
+            "total": self.total,
+            "chunks_total": self.chunks_total,
+            "chunks_done": chunks_done,
+            "bytes_done": self.bytes_done.load(Ordering::Relaxed),
+            "resumed": self.resumed,
+            "elapsed_secs": self.started.elapsed().as_secs(),
+        })
+    }
+}
+
+/// Removes the download entry when the download task ends, however it ends.
+pub struct ActiveDownloadGuard {
+    stats: Arc<Stats>,
+    hex: String,
+    handle: Arc<ActiveDownload>,
+}
+
+impl ActiveDownloadGuard {
+    pub fn new(stats: Arc<Stats>, download: ActiveDownload) -> Self {
+        let hex = download.digest.trim_start_matches("sha256:").to_owned();
+        let handle = Arc::new(download);
+        if let Ok(mut map) = stats.active_downloads.try_lock() {
+            map.insert(hex.clone(), Arc::clone(&handle));
+        }
+        Self { stats, hex, handle }
+    }
+
+    pub fn handle(&self) -> Arc<ActiveDownload> {
+        Arc::clone(&self.handle)
+    }
+}
+
+impl Drop for ActiveDownloadGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.stats.active_downloads.try_lock() {
+            map.remove(&self.hex);
+        }
+    }
 }
 
 pub struct CachedBlob {
@@ -81,6 +144,29 @@ impl DiskCache {
 
     pub fn blob_path(&self, hex: &str) -> PathBuf {
         self.root.join("sha256").join(&hex[..2]).join(hex)
+    }
+
+    /// Number of committed blob files currently on disk (dashboard metric).
+    pub async fn entry_count(&self) -> u64 {
+        let mut count = 0;
+        let mut buckets = match tokio::fs::read_dir(self.root.join("sha256")).await {
+            Ok(dir) => dir,
+            Err(_) => return 0,
+        };
+        while let Ok(Some(bucket)) = buckets.next_entry().await {
+            let mut files = match tokio::fs::read_dir(bucket.path()).await {
+                Ok(dir) => dir,
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = files.next_entry().await {
+                if let Ok(meta) = entry.metadata().await {
+                    if meta.is_file() && !entry.path().extension().is_some_and(|e| e == "part") {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
     }
 
     pub async fn lookup(&self, hex: &str) -> Option<CachedBlob> {
@@ -228,6 +314,10 @@ impl ManifestCache {
     pub async fn clear(&self) {
         let mut map = self.entries.lock().await;
         map.clear();
+    }
+
+    pub async fn len(&self) -> usize {
+        self.entries.lock().await.len()
     }
 }
 

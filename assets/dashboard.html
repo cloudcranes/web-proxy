@@ -1,65 +1,110 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>web-proxy dashboard</title>
-  <meta http-equiv="refresh" content="10">
+  <title>web-proxy 控制台</title>
   <style>
-    body { font: 14px/1.4 ui-monospace, Menlo, Consolas, monospace; margin: 1.5rem; color: #1a1a1a; }
-    h1 { font-size: 1.2rem; margin: 0 0 1rem; }
-    table { border-collapse: collapse; margin-bottom: 1.5rem; }
-    th, td { padding: 4px 10px; text-align: left; border-bottom: 1px solid #ddd; }
-    th { background: #f5f5f5; }
-    .bar { background: #4a8bf5; height: 10px; display: inline-block; vertical-align: middle; }
-    .up { color: #1a7f37; }
-    .down { color: #c93c37; }
-    .muted { color: #666; }
-    button {
-      font: inherit; padding: 4px 12px; margin: 0 6px 6px 0; cursor: pointer;
-      border: 1px solid #999; background: #fafafa; border-radius: 3px;
+    :root {
+      --bg: #0f1420; --panel: #171e2e; --panel2: #1d2639; --line: #2a3550;
+      --fg: #dde5f2; --muted: #7d8aa5; --accent: #4a8bf5; --ok: #34c77b;
+      --warn: #e0a63a; --bad: #e05a5a;
     }
-    button:hover { background: #eee; }
-    button:disabled { opacity: 0.5; cursor: default; }
-    #msg { margin-left: 8px; }
+    * { box-sizing: border-box; }
+    body {
+      font: 14px/1.5 ui-monospace, Menlo, Consolas, "Microsoft YaHei", monospace;
+      margin: 0; padding: 1.5rem 2rem; background: var(--bg); color: var(--fg);
+    }
+    h1 { font-size: 1.15rem; margin: 0; display: flex; align-items: baseline; gap: .75rem; }
+    h1 .muted { font-weight: normal; font-size: .8rem; }
+    header { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: .5rem; margin-bottom: 1.2rem; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: .8rem; margin-bottom: 1.2rem; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .8rem 1rem; }
+    .card .label { color: var(--muted); font-size: .75rem; letter-spacing: .05em; }
+    .card .value { font-size: 1.35rem; margin-top: .2rem; }
+    .card .sub { color: var(--muted); font-size: .72rem; margin-top: .15rem; }
+    .meter { height: 6px; background: var(--panel2); border-radius: 3px; margin-top: .5rem; overflow: hidden; }
+    .meter > div { height: 100%; background: var(--accent); width: 0; transition: width .6s; }
+    section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1rem; margin-bottom: 1.2rem; }
+    section h2 { font-size: .85rem; margin: 0 0 .6rem; color: var(--muted); font-weight: normal; letter-spacing: .05em; }
+    table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+    th, td { padding: 5px 10px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    th { color: var(--muted); font-weight: normal; border-bottom: 1px solid var(--line); }
+    tr:last-child td { border-bottom: none; }
+    .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); } .muted { color: var(--muted); }
+    .dbar { background: var(--panel2); border-radius: 4px; height: 12px; min-width: 160px; overflow: hidden; }
+    .dbar > div { height: 100%; background: linear-gradient(90deg, var(--accent), var(--ok)); transition: width .5s; }
+    .badge { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: .72rem; }
+    .badge.resume { background: #3a2f14; color: var(--warn); }
+    .badge.live { background: #14301f; color: var(--ok); }
+    button {
+      font: inherit; padding: 5px 14px; margin-right: .6rem; cursor: pointer; color: var(--fg);
+      border: 1px solid var(--line); background: var(--panel2); border-radius: 5px;
+    }
+    button:hover { border-color: var(--accent); }
+    button:disabled { opacity: .5; cursor: default; }
+    #msg { margin-left: .4rem; }
+    footer { color: var(--muted); font-size: .75rem; }
+    footer code { color: var(--fg); }
   </style>
 </head>
 <body>
-  <h1>web-proxy</h1>
+  <header>
+    <h1>web-proxy 控制台 <span class="muted" id="meta">–</span></h1>
+    <span class="muted">自动刷新 5s · 下载进度 2s</span>
+  </header>
 
-  <table id="cache">
-    <tr><th colspan="2">cache</th></tr>
-    <tr><td>hits</td><td id="hits">–</td></tr>
-    <tr><td>misses</td><td id="misses">–</td></tr>
-    <tr><td>bytes from cache</td><td id="bc">–</td></tr>
-    <tr><td>bytes from upstream</td><td id="bu">–</td></tr>
-    <tr><td>disk bytes / cap</td><td id="disk">–</td></tr>
-    <tr><td>hit ratio</td><td id="ratio">–</td></tr>
-  </table>
-
-  <table id="sources">
-    <tr><th>source</th><th>score</th><th>p50 ms</th><th>throughput</th><th>success / fail</th><th>range</th><th>last probe</th></tr>
-  </table>
-
-  <div style="margin-bottom:1.5rem">
-    <button id="btn-probe" onclick="doProbe()">re-probe sources now</button>
-    <button id="btn-clear" onclick="doClear()">clear cache</button>
-    <span id="msg" class="muted"></span>
+  <div class="cards">
+    <div class="card"><div class="label">命中率</div><div class="value" id="c-ratio">–</div><div class="sub" id="c-hits">–</div></div>
+    <div class="card"><div class="label">已省流量（缓存命中）</div><div class="value" id="c-saved">–</div><div class="sub" id="c-up">–</div></div>
+    <div class="card"><div class="label">磁盘缓存</div><div class="value" id="c-disk">–</div>
+      <div class="meter"><div id="c-diskbar"></div></div>
+      <div class="sub" id="c-entries">–</div></div>
+    <div class="card"><div class="label">活跃下载</div><div class="value" id="c-active">–</div><div class="sub" id="c-plan">–</div></div>
   </div>
 
-  <p class="muted">auto-refresh every 10s · /stats and /sources expose the same JSON</p>
+  <section>
+    <h2>进行中的下载（分块进度）</h2>
+    <table id="downloads">
+      <tr><th>仓库 / 路径</th><th>digest</th><th>进度</th><th>已传输</th><th>分块</th><th>耗时</th><th>来源</th></tr>
+      <tr><td colspan="7" class="muted">暂无进行中的下载</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>上游源</h2>
+    <table id="sources">
+      <tr><th>源</th><th>权重</th><th>p50 ms</th><th>吞吐</th><th>成功 / 失败</th><th>Range</th><th>最近活动</th></tr>
+    </table>
+  </section>
+
+  <section>
+    <button id="btn-probe" onclick="doProbe()">重新测速</button>
+    <button id="btn-clear" onclick="doClear()">清空缓存</button>
+    <span id="msg"></span>
+  </section>
+
+  <footer>
+    API：<code>/stats</code> · <code>/downloads</code> · <code>/sources</code> · <code>POST /sources/probe</code> · <code>POST /cache/clear</code> · <code>/healthz</code>
+  </footer>
 
   <script>
     function fmtBytes(n) {
+      if (!isFinite(n)) return '–';
       if (n < 1024) return n + ' B';
-      const units = ['KB','MB','GB','TB'];
+      const units = ['KiB', 'MiB', 'GiB', 'TiB'];
       let v = n / 1024, i = 0;
       while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-      return v.toFixed(1) + ' ' + units[i];
+      return v.toFixed(v >= 100 ? 0 : 1) + ' ' + units[i];
+    }
+    function fmtDur(s) {
+      if (s < 60) return s + 's';
+      if (s < 3600) return Math.floor(s / 60) + 'm' + (s % 60) + 's';
+      return Math.floor(s / 3600) + 'h' + Math.floor((s % 3600) / 60) + 'm';
     }
     function say(text, isError) {
       const el = document.getElementById('msg');
       el.textContent = text;
-      el.className = isError ? 'down' : 'up';
+      el.className = isError ? 'bad' : 'ok';
       setTimeout(() => { el.textContent = ''; }, 4000);
     }
     async function doProbe() {
@@ -67,72 +112,87 @@
       btn.disabled = true;
       try {
         const r = await fetch('/sources/probe', { method: 'POST' });
-        say(r.ok ? 'probe triggered' : 'probe failed: HTTP ' + r.status, !r.ok);
+        say(r.ok ? '已触发测速' : '测速失败: HTTP ' + r.status, !r.ok);
         setTimeout(loadSources, 1200);
-      } catch (e) {
-        say('probe failed: ' + e, true);
-      } finally {
-        btn.disabled = false;
-      }
+      } catch (e) { say('测速失败: ' + e, true); }
+      finally { btn.disabled = false; }
     }
     async function doClear() {
-      if (!confirm('Clear all cached blobs? In-flight downloads keep going.')) return;
+      if (!confirm('确认清空所有缓存 blob？进行中的下载会继续完成。')) return;
       const btn = document.getElementById('btn-clear');
       btn.disabled = true;
       try {
         const r = await fetch('/cache/clear', { method: 'POST' });
         const j = await r.json();
-        if (r.ok) {
-          say('cleared ' + fmtBytes(j.freed_bytes || 0));
-          loadStats();
-        } else {
-          say('clear failed: HTTP ' + r.status, true);
-        }
-      } catch (e) {
-        say('clear failed: ' + e, true);
-      } finally {
-        btn.disabled = false;
-      }
+        if (r.ok) { say('已清空，释放 ' + fmtBytes(j.freed_bytes || 0)); loadStats(); }
+        else say('清空失败: HTTP ' + r.status, true);
+      } catch (e) { say('清空失败: ' + e, true); }
+      finally { btn.disabled = false; }
     }
     function loadStats() {
       fetch('/stats').then(r => r.json()).then(s => {
-        document.getElementById('hits').textContent = s.blob_cache_hits;
-        document.getElementById('misses').textContent = s.blob_cache_misses;
-        document.getElementById('bc').textContent = fmtBytes(s.bytes_from_cache);
-        document.getElementById('bu').textContent = fmtBytes(s.bytes_from_upstream);
-        const pct = s.disk_cap_bytes ? Math.min(100, s.disk_bytes * 100 / s.disk_cap_bytes) : 0;
-        document.getElementById('disk').innerHTML =
-          fmtBytes(s.disk_bytes) + ' / ' + fmtBytes(s.disk_cap_bytes) +
-          ' <span class="bar" style="width:' + pct + 'px"></span>';
         const total = s.blob_cache_hits + s.blob_cache_misses;
-        document.getElementById('ratio').textContent =
-          total ? (s.blob_cache_hits * 100 / total).toFixed(1) + '%' : '–';
-      }).catch(e => {
-        document.getElementById('cache').innerHTML =
-          '<tr><td colspan="2" class="down">stats fetch failed: ' + e + '</td></tr>';
-      });
+        document.getElementById('c-ratio').textContent = total ? (s.blob_cache_hits * 100 / total).toFixed(1) + '%' : '–';
+        document.getElementById('c-hits').textContent = '命中 ' + s.blob_cache_hits + ' / 未命中 ' + s.blob_cache_misses;
+        document.getElementById('c-saved').textContent = fmtBytes(s.bytes_from_cache);
+        document.getElementById('c-up').textContent = '上行拉取 ' + fmtBytes(s.bytes_from_upstream);
+        const pct = s.disk_cap_bytes ? Math.min(100, s.disk_bytes * 100 / s.disk_cap_bytes) : 0;
+        document.getElementById('c-disk').textContent = fmtBytes(s.disk_bytes);
+        document.getElementById('c-diskbar').style.width = pct + '%';
+        document.getElementById('c-entries').textContent =
+          s.cache_entries + ' 个 blob / manifest ' + s.manifest_entries + ' 条 / 上限 ' + fmtBytes(s.disk_cap_bytes);
+        document.getElementById('c-active').textContent = s.active_downloads;
+        document.getElementById('c-plan').textContent = '分块 ' + s.chunk_mib + ' MiB × 并发 ' + s.chunk_concurrency;
+        document.getElementById('meta').textContent = 'v' + s.version + ' · 已运行 ' + fmtDur(s.uptime_secs);
+      }).catch(() => {});
     }
-    function loadSources() {
-      fetch('/sources').then(r => r.json()).then(rows => {
-        const tb = document.getElementById('sources');
-        tb.innerHTML = '<tr><th>source</th><th>score</th><th>p50 ms</th><th>throughput</th><th>success / fail</th><th>range</th><th>last probe</th></tr>';
-        rows.forEach(r => {
+    function loadDownloads() {
+      fetch('/downloads').then(r => r.json()).then(rows => {
+        const tb = document.getElementById('downloads');
+        tb.innerHTML = '<tr><th>仓库 / 路径</th><th>digest</th><th>进度</th><th>已传输</th><th>分块</th><th>耗时</th><th>来源</th></tr>';
+        if (!rows.length) {
           const tr = document.createElement('tr');
-          const mbps = (r.throughput_bps / 1048576).toFixed(1);
+          tr.innerHTML = '<td colspan="7" class="muted">暂无进行中的下载</td>';
+          tb.appendChild(tr);
+          return;
+        }
+        rows.forEach(d => {
+          const pct = d.total ? Math.min(100, d.bytes_done * 100 / d.total) : 0;
+          const tr = document.createElement('tr');
           tr.innerHTML =
-            '<td>' + r.name + '</td>' +
-            '<td>' + r.weight.toFixed(3) + '</td>' +
-            '<td>' + r.p50_ms + '</td>' +
-            '<td class="muted">' + (r.throughput_bps ? mbps + ' MiB/s' : '–') + '</td>' +
-            '<td>' + r.success + ' / ' + r.failure + '</td>' +
-            '<td class="' + (r.range_ok ? 'up' : 'down') + '">' + (r.range_ok ? 'yes' : 'no') + '</td>' +
-            '<td class="muted">' + (r.last_seen ? 'recent' : '–') + '</td>';
+            '<td>' + d.path + '</td>' +
+            '<td class="muted">' + String(d.digest).slice(7, 19) + '…</td>' +
+            '<td><div class="dbar"><div style="width:' + pct + '%"></div></div></td>' +
+            '<td>' + fmtBytes(d.bytes_done) + ' / ' + fmtBytes(d.total) + '</td>' +
+            '<td>' + d.chunks_done + ' / ' + d.chunks_total + '</td>' +
+            '<td class="muted">' + fmtDur(d.elapsed_secs) + '</td>' +
+            '<td>' + (d.resumed ? '<span class="badge resume">续传</span>' : '<span class="badge live">新下载</span>') + '</td>';
           tb.appendChild(tr);
         });
       }).catch(() => {});
     }
-    loadStats();
-    loadSources();
+    function loadSources() {
+      fetch('/sources').then(r => r.json()).then(rows => {
+        const tb = document.getElementById('sources');
+        tb.innerHTML = '<tr><th>源</th><th>权重</th><th>p50 ms</th><th>吞吐</th><th>成功 / 失败</th><th>Range</th><th>最近活动</th></tr>';
+        rows.forEach(r => {
+          const tr = document.createElement('tr');
+          tr.innerHTML =
+            '<td>' + r.name + '</td>' +
+            '<td>' + r.weight.toFixed(3) + '</td>' +
+            '<td>' + r.p50_ms + '</td>' +
+            '<td>' + (r.throughput_bps ? fmtBytes(r.throughput_bps) + '/s' : '–') + '</td>' +
+            '<td>' + r.success + ' / ' + r.failure + '</td>' +
+            '<td class="' + (r.range_ok ? 'ok' : 'bad') + '">' + (r.range_ok ? '支持' : '不支持') + '</td>' +
+            '<td class="muted">' + (r.last_seen ? '活跃' : '–') + '</td>';
+          tb.appendChild(tr);
+        });
+      }).catch(() => {});
+    }
+    loadStats(); loadDownloads(); loadSources();
+    setInterval(loadStats, 5000);
+    setInterval(loadDownloads, 2000);
+    setInterval(loadSources, 5000);
   </script>
 </body>
 </html>

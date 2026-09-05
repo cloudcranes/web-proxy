@@ -8,7 +8,7 @@ use std::{
     net::IpAddr,
     path::PathBuf,
     sync::{atomic::Ordering, Arc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
@@ -23,7 +23,7 @@ use axum::{
         },
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
     },
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
 };
@@ -109,6 +109,7 @@ struct AppState {
     cache: Arc<DiskCache>,
     manifests: Arc<ManifestCache>,
     stats: Arc<Stats>,
+    started: Instant,
 }
 
 enum RegistryKind {
@@ -231,11 +232,14 @@ async fn main() -> Result<()> {
         cache: Arc::new(cache),
         manifests: Arc::new(manifests),
         stats: Arc::new(Stats::default()),
+        started: Instant::now(),
     });
 
     let app = Router::new()
+        .route("/", get(dashboard_redirect))
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
+        .route("/downloads", get(downloads))
         .route("/sources", get(sources_view))
         .route("/sources/probe", post(trigger_probe))
         .route("/cache/clear", post(clear_cache))
@@ -446,6 +450,7 @@ async fn healthz(method: Method) -> Response {
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Response {
+    let (chunk_mib, chunk_concurrency) = state.sources.chunk_plan().await;
     let body = serde_json::json!({
         "blob_cache_hits": state.stats.blob_hits.load(Ordering::Relaxed),
         "blob_cache_misses": state.stats.blob_misses.load(Ordering::Relaxed),
@@ -453,8 +458,29 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
         "bytes_from_upstream": state.stats.bytes_from_upstream.load(Ordering::Relaxed),
         "disk_bytes": state.cache.bytes_on_disk(),
         "disk_cap_bytes": state.cache.max_bytes(),
+        "cache_entries": state.cache.entry_count().await,
+        "manifest_entries": state.manifests.len().await,
+        "active_downloads": state.stats.active_downloads.lock().await.len(),
+        "uptime_secs": state.started.elapsed().as_secs(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "chunk_mib": chunk_mib / 1024 / 1024,
+        "chunk_concurrency": chunk_concurrency,
     });
     ([(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
+async fn downloads(State(state): State<Arc<AppState>>) -> Response {
+    let map = state.stats.active_downloads.lock().await;
+    let rows: Vec<serde_json::Value> = map.values().map(|d| d.progress_json()).collect();
+    (
+        [(CONTENT_TYPE, "application/json")],
+        serde_json::json!(rows).to_string(),
+    )
+        .into_response()
+}
+
+async fn dashboard_redirect() -> Response {
+    Redirect::temporary("/dashboard").into_response()
 }
 
 async fn sources_view(State(state): State<Arc<AppState>>) -> Response {
