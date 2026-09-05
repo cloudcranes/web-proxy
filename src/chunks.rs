@@ -52,8 +52,8 @@ pub fn split(total: u64) -> Vec<Chunk> {
 /// Drive the chunked download to completion, emitting pieces in offset order
 /// to `tx` for the client. Returns the final sha256 hex on success.
 pub async fn download(
-    client: &Client,
-    pool: &SourcePool,
+    client: Client,
+    pool: Arc<SourcePool>,
     cache: Arc<DiskCache>,
     stats: Arc<Stats>,
     registry: String,
@@ -63,7 +63,7 @@ pub async fn download(
     total_size: u64,
     part_path: PathBuf,
     final_path: PathBuf,
-    tx: Option<mpsc::Sender<Result<Bytes, std::io::Error>>>,
+    mut tx: Option<mpsc::Sender<Result<Bytes, std::io::Error>>>,
 ) -> Result<String> {
     let chunks = split(total_size);
     let dir = part_path
@@ -88,6 +88,10 @@ pub async fn download(
         let sem = Arc::clone(&sem);
         let shared = Arc::clone(&shared);
         let total_received = Arc::clone(&total_received);
+        let client = client.clone();
+        let pool = Arc::clone(&pool);
+        let token = token.clone();
+        let path = path.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore closed");
             let mut attempt = 0;
