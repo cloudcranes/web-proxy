@@ -27,12 +27,20 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use cache::{CachedBlob, DiskCache, ManifestCache, Stats};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder as HttpConnBuilder;
 use reqwest::{redirect::Policy, Client};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_rustls::TlsAcceptor;
 use tower::limit::ConcurrencyLimitLayer;
+use tower::ServiceExt;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{info, warn};
 use url::Url;
@@ -232,16 +240,174 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
-    info!(%listen_addr, "listening");
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+
+    let tls_acceptor = load_tls_acceptor()?;
+    if let Some(acceptor) = tls_acceptor {
+        info!(%listen_addr, "listening (TLS)");
+        serve_tls(listener, app, acceptor, drain_timeout).await?;
+    } else {
+        info!(%listen_addr, "listening (HTTP)");
+        let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+        tokio::select! {
+            result = server => result.context("serve HTTP")?,
+            // Cap how long in-flight blob transfers may hold the process after
+            // the shutdown signal; past this point connections are dropped so
+            // container stops don't hang until the runtime kill timeout.
+            _ = drain_deadline(drain_timeout) => {
+                warn!(drain_timeout_secs = drain_timeout, "drain timeout exceeded; closing remaining connections");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_tls_acceptor() -> Result<Option<TlsAcceptor>> {
+    let cert_path = env::var("TLS_CERT_PATH")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let key_path = env::var("TLS_KEY_PATH")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let (cert_path, key_path) = match (cert_path, key_path) {
+        (None, None) => return Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("TLS_CERT_PATH and TLS_KEY_PATH must be set together");
+        }
+        (Some(cert_path), Some(key_path)) => (cert_path, key_path),
+    };
+
+    let cert_pem = std::fs::read_to_string(&cert_path)
+        .with_context(|| format!("read TLS certificate {cert_path}"))?;
+    let key_pem =
+        std::fs::read_to_string(&key_path).with_context(|| format!("read TLS key {key_path}"))?;
+    let certs: Vec<CertificateDer<'static>> = pem_der_blocks(&cert_pem, "CERTIFICATE")
+        .into_iter()
+        .map(CertificateDer::from)
+        .collect();
+    if certs.is_empty() {
+        bail!("no CERTIFICATE PEM block found in {cert_path}");
+    }
+    let key = private_key_from_pem(&key_pem, &key_path)?;
+
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("select TLS protocol versions")?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .context("load TLS certificate/key pair")?;
+    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+}
+
+fn private_key_from_pem(pem: &str, key_path: &str) -> Result<PrivateKeyDer<'static>> {
+    const SUPPORTED: &[(&str, fn(Vec<u8>) -> PrivateKeyDer<'static>)] = &[
+        ("PRIVATE KEY", |der| {
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der))
+        }),
+        ("RSA PRIVATE KEY", |der| {
+            PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der))
+        }),
+        ("EC PRIVATE KEY", |der| {
+            PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der))
+        }),
+    ];
+    for (label, wrap) in SUPPORTED {
+        if let Some(der) = pem_der_blocks(pem, label).into_iter().next() {
+            return Ok(wrap(der));
+        }
+    }
+    bail!("no supported private key PEM block (PKCS#8/RSA/EC) found in {key_path}");
+}
+
+fn pem_der_blocks(pem: &str, label: &str) -> Vec<Vec<u8>> {
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let mut ders = Vec::new();
+    let mut rest = pem;
+    while let Some(start) = rest.find(&begin) {
+        let body_start = start + begin.len();
+        let Some(stop) = rest[body_start..].find(&end) else {
+            // Unterminated block: skip past this BEGIN marker and keep looking.
+            rest = &rest[body_start..];
+            continue;
+        };
+        let encoded: String = rest[body_start..body_start + stop]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        match BASE64_STANDARD.decode(encoded.as_bytes()) {
+            Ok(der) => ders.push(der),
+            // Malformed body (e.g. a nested marker swallowed an END): skip it.
+            Err(_) => {
+                rest = &rest[body_start..];
+                continue;
+            }
+        }
+        rest = &rest[body_start + stop + end.len()..];
+    }
+    ders
+}
+
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    acceptor: TlsAcceptor,
+    drain_timeout: u64,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _peer) = accepted.context("accept TLS connection")?;
+                let acceptor = acceptor.clone();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let tls = match acceptor.accept(stream).await {
+                        Ok(tls) => tls,
+                        Err(error) => {
+                            warn!(%error, "TLS handshake failed");
+                            return;
+                        }
+                    };
+                    serve_tls_conn(TokioIo::new(tls), app, drain_timeout).await;
+                });
+            }
+            _ = shutdown_signal() => return Ok(()),
+        }
+    }
+}
+
+async fn serve_tls_conn(
+    io: TokioIo<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    app: Router,
+    drain_timeout: u64,
+) {
+    // axum's Router speaks Service<Request<Body>>, hyper feeds Request<Incoming>:
+    // bridge the body types per request via service_fn + oneshot.
+    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let app = app.clone();
+        async move { app.oneshot(req.map(Body::new)).await }
+    });
+    let builder = HttpConnBuilder::new(TokioExecutor::new());
+    let mut conn = std::pin::pin!(builder.serve_connection_with_upgrades(io, service));
     tokio::select! {
-        result = server => result.context("serve HTTP"),
-        // Cap how long in-flight blob transfers may hold the process after
-        // the shutdown signal; past this point connections are dropped so
-        // container stops don't hang until the runtime kill timeout.
-        _ = drain_deadline(drain_timeout) => {
-            warn!(drain_timeout_secs = drain_timeout, "drain timeout exceeded; closing remaining connections");
-            Ok(())
+        result = conn.as_mut() => {
+            if let Err(error) = result {
+                warn!(%error, "TLS connection error");
+            }
+        }
+        _ = shutdown_signal() => {
+            conn.as_mut().graceful_shutdown();
+            tokio::select! {
+                result = conn.as_mut() => {
+                    if let Err(error) = result {
+                        warn!(%error, "TLS connection error during drain");
+                    }
+                }
+                _ = drain_deadline(drain_timeout) => {
+                    warn!(drain_timeout_secs = drain_timeout, "drain timeout exceeded; closing remaining connections");
+                }
+            }
         }
     }
 }
@@ -1618,5 +1784,44 @@ mod tests {
         assert_eq!(sha256_hex("sha256:abc"), None);
         assert_eq!(sha256_hex("sha512:abc"), None);
         assert_eq!(sha256_hex("sha256:"), None);
+    }
+
+    #[test]
+    fn parses_pem_certificate_blocks() {
+        let pem = concat!(
+            "-----BEGIN CERTIFICATE-----\n",
+            "YWJj\n",
+            "-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\n",
+            "ZGVm\n",
+            "-----END CERTIFICATE-----\n",
+        );
+        let blocks = pem_der_blocks(pem, "CERTIFICATE");
+        assert_eq!(blocks, vec![b"abc".to_vec(), b"def".to_vec()]);
+    }
+
+    #[test]
+    fn ignores_incomplete_pem_blocks() {
+        let pem = concat!(
+            "-----BEGIN CERTIFICATE-----\n",
+            "YWJj\n", // missing END marker
+            "-----BEGIN CERTIFICATE-----\n",
+            "ZGVm\n",
+            "-----END CERTIFICATE-----\n",
+        );
+        assert_eq!(pem_der_blocks(pem, "CERTIFICATE"), vec![b"def".to_vec()]);
+    }
+
+    #[test]
+    fn private_key_from_pem_detects_pkcs8() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nYWJjZA==\n-----END PRIVATE KEY-----\n";
+        let key = private_key_from_pem(pem, "test.pem").unwrap();
+        assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
+    }
+
+    #[test]
+    fn private_key_from_pem_rejects_unknown() {
+        let pem = "-----BEGIN SOMETHING-----\nYWJjZA==\n-----END SOMETHING-----\n";
+        assert!(private_key_from_pem(pem, "test.pem").is_err());
     }
 }

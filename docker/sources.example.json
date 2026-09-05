@@ -1,0 +1,16 @@
+{
+  "sources": [
+    {
+      "name": "dockerhub-daocloud",
+      "registry": "https://docker.m.daocloud.io",
+      "token": "https://m.daocloud.io/auth/token",
+      "service": "docker.m.daocloud.io"
+    },
+    {
+      "name": "dockerhub-official",
+      "registry": "https://registry-1.docker.io",
+      "token": "https://auth.docker.io/token",
+      "service": "registry.docker.io"
+    }
+  ]
+}
