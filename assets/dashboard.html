@@ -14,10 +14,18 @@
     .up { color: #1a7f37; }
     .down { color: #c93c37; }
     .muted { color: #666; }
+    button {
+      font: inherit; padding: 4px 12px; margin: 0 6px 6px 0; cursor: pointer;
+      border: 1px solid #999; background: #fafafa; border-radius: 3px;
+    }
+    button:hover { background: #eee; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    #msg { margin-left: 8px; }
   </style>
 </head>
 <body>
   <h1>web-proxy</h1>
+
   <table id="cache">
     <tr><th colspan="2">cache</th></tr>
     <tr><td>hits</td><td id="hits">–</td></tr>
@@ -27,10 +35,19 @@
     <tr><td>disk bytes / cap</td><td id="disk">–</td></tr>
     <tr><td>hit ratio</td><td id="ratio">–</td></tr>
   </table>
+
   <table id="sources">
     <tr><th>source</th><th>score</th><th>p50 ms</th><th>success / fail</th><th>range</th><th>last probe</th></tr>
   </table>
-  <p class="muted">auto-refresh every 10s · /stats exposes the same JSON</p>
+
+  <div style="margin-bottom:1.5rem">
+    <button id="btn-probe" onclick="doProbe()">re-probe sources now</button>
+    <button id="btn-clear" onclick="doClear()">clear cache</button>
+    <span id="msg" class="muted"></span>
+  </div>
+
+  <p class="muted">auto-refresh every 10s · /stats and /sources expose the same JSON</p>
+
   <script>
     function fmtBytes(n) {
       if (n < 1024) return n + ' B';
@@ -39,42 +56,81 @@
       while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
       return v.toFixed(1) + ' ' + units[i];
     }
-    function ago(iso) {
-      if (!iso) return '–';
-      const ms = Date.now() - Date.parse(iso);
-      if (ms < 0) return 'just now';
-      if (ms < 60_000) return Math.floor(ms / 1000) + 's ago';
-      return Math.floor(ms / 60_000) + 'm ago';
+    function say(text, isError) {
+      const el = document.getElementById('msg');
+      el.textContent = text;
+      el.className = isError ? 'down' : 'up';
+      setTimeout(() => { el.textContent = ''; }, 4000);
     }
-    fetch('/stats').then(r => r.json()).then(s => {
-      document.getElementById('hits').textContent = s.blob_cache_hits;
-      document.getElementById('misses').textContent = s.blob_cache_misses;
-      document.getElementById('bc').textContent = fmtBytes(s.bytes_from_cache);
-      document.getElementById('bu').textContent = fmtBytes(s.bytes_from_upstream);
-      const pct = s.disk_cap_bytes ? Math.min(100, s.disk_bytes * 100 / s.disk_cap_bytes) : 0;
-      document.getElementById('disk').innerHTML =
-        fmtBytes(s.disk_bytes) + ' / ' + fmtBytes(s.disk_cap_bytes) +
-        ' <span class="bar" style="width:' + pct + 'px"></span>';
-      const total = s.blob_cache_hits + s.blob_cache_misses;
-      document.getElementById('ratio').textContent =
-        total ? (s.blob_cache_hits * 100 / total).toFixed(1) + '%' : '–';
-    }).catch(e => document.getElementById('cache').innerHTML =
-      '<tr><td colspan="2" class="down">stats fetch failed: ' + e + '</td></tr>');
-    fetch('/sources').then(r => r.json()).then(rows => {
-      const tb = document.getElementById('sources');
-      rows.forEach(r => {
-        const tr = document.createElement('tr');
-        const score = Math.min(1, r.weight);
-        tr.innerHTML =
-          '<td>' + r.name + '</td>' +
-          '<td>' + score.toFixed(3) + '</td>' +
-          '<td>' + r.p50_ms + '</td>' +
-          '<td>' + r.success + ' / ' + r.failure + '</td>' +
-          '<td class="' + (r.range_ok ? 'up' : 'down') + '">' + (r.range_ok ? 'yes' : 'no') + '</td>' +
-          '<td class="muted">' + ago(r.last_seen) + '</td>';
-        tb.appendChild(tr);
+    async function doProbe() {
+      const btn = document.getElementById('btn-probe');
+      btn.disabled = true;
+      try {
+        const r = await fetch('/sources/probe', { method: 'POST' });
+        say(r.ok ? 'probe triggered' : 'probe failed: HTTP ' + r.status, !r.ok);
+        setTimeout(loadSources, 1200);
+      } catch (e) {
+        say('probe failed: ' + e, true);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+    async function doClear() {
+      if (!confirm('Clear all cached blobs? In-flight downloads keep going.')) return;
+      const btn = document.getElementById('btn-clear');
+      btn.disabled = true;
+      try {
+        const r = await fetch('/cache/clear', { method: 'POST' });
+        const j = await r.json();
+        if (r.ok) {
+          say('cleared ' + fmtBytes(j.freed_bytes || 0));
+          loadStats();
+        } else {
+          say('clear failed: HTTP ' + r.status, true);
+        }
+      } catch (e) {
+        say('clear failed: ' + e, true);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+    function loadStats() {
+      fetch('/stats').then(r => r.json()).then(s => {
+        document.getElementById('hits').textContent = s.blob_cache_hits;
+        document.getElementById('misses').textContent = s.blob_cache_misses;
+        document.getElementById('bc').textContent = fmtBytes(s.bytes_from_cache);
+        document.getElementById('bu').textContent = fmtBytes(s.bytes_from_upstream);
+        const pct = s.disk_cap_bytes ? Math.min(100, s.disk_bytes * 100 / s.disk_cap_bytes) : 0;
+        document.getElementById('disk').innerHTML =
+          fmtBytes(s.disk_bytes) + ' / ' + fmtBytes(s.disk_cap_bytes) +
+          ' <span class="bar" style="width:' + pct + 'px"></span>';
+        const total = s.blob_cache_hits + s.blob_cache_misses;
+        document.getElementById('ratio').textContent =
+          total ? (s.blob_cache_hits * 100 / total).toFixed(1) + '%' : '–';
+      }).catch(e => {
+        document.getElementById('cache').innerHTML =
+          '<tr><td colspan="2" class="down">stats fetch failed: ' + e + '</td></tr>';
       });
-    }).catch(() => {});
+    }
+    function loadSources() {
+      fetch('/sources').then(r => r.json()).then(rows => {
+        const tb = document.getElementById('sources');
+        tb.innerHTML = '<tr><th>source</th><th>score</th><th>p50 ms</th><th>success / fail</th><th>range</th><th>last probe</th></tr>';
+        rows.forEach(r => {
+          const tr = document.createElement('tr');
+          tr.innerHTML =
+            '<td>' + r.name + '</td>' +
+            '<td>' + r.weight.toFixed(3) + '</td>' +
+            '<td>' + r.p50_ms + '</td>' +
+            '<td>' + r.success + ' / ' + r.failure + '</td>' +
+            '<td class="' + (r.range_ok ? 'up' : 'down') + '">' + (r.range_ok ? 'yes' : 'no') + '</td>' +
+            '<td class="muted">' + (r.last_seen ? 'recent' : '–') + '</td>';
+          tb.appendChild(tr);
+        });
+      }).catch(() => {});
+    }
+    loadStats();
+    loadSources();
   </script>
 </body>
 </html>
