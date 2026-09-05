@@ -859,17 +859,6 @@ async fn proxy_blob(
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
 
-    // Token broker call: single-source, mirrors the manifest path.
-    let token_broker = registry.config(state);
-    let token_url = match Url::parse(&token_broker.token_url) {
-        Ok(url) => url,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    let token = match fetch_token_for(&state.client, &token_broker, &path).await {
-        Ok(token) => token,
-        Err(response) => return response,
-    };
-
     let total_size = match content_length {
         Some(len) => len,
         None => {
@@ -911,7 +900,6 @@ async fn proxy_blob(
             stats,
             registry_label,
             path_for_task,
-            token,
             digest.clone(),
             total_size,
             part_path,

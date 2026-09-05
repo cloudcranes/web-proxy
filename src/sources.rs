@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
@@ -60,6 +60,9 @@ pub struct SourcePool {
     stats: RwLock<Vec<SourceStats>>,
     weights: RwLock<Vec<f64>>,
     seq: AtomicU64,
+    /// Anonymous bearer tokens per (source index, repository), refreshed
+    /// before expiry so parallel chunks of one blob reuse one fetch.
+    token_cache: Mutex<HashMap<(usize, String), (String, Instant)>>,
 }
 
 impl SourcePool {
@@ -72,6 +75,7 @@ impl SourcePool {
             stats: RwLock::new(vec![SourceStats::default(); n]),
             weights: RwLock::new(vec![1.0; n]),
             seq: AtomicU64::new(0),
+            token_cache: Mutex::new(HashMap::new()),
         });
         // Seed an initial probe so the first download isn't blind.
         let seed = Arc::clone(&pool);
@@ -210,6 +214,92 @@ impl SourcePool {
         let stats = self.stats.read().await;
         let total_bps: u64 = stats.iter().map(|s| s.throughput_bps).sum();
         chunk_plan_for(total_bps)
+    }
+
+    /// Anonymous pull token for one source's blob endpoint. Empty
+    /// `token_url` marks an anonymous source (no Authorization at all).
+    /// Tokens are cached per (source, repository) until shortly before
+    /// expiry because parallel chunks of one blob would otherwise each
+    /// trigger a fetch.
+    pub async fn blob_token(&self, index: usize, path: &str) -> String {
+        let spec = match self.specs.get(index) {
+            Some(spec) => spec,
+            None => return String::new(),
+        };
+        if spec.token_url.is_empty() {
+            return String::new();
+        }
+        // /v2/<repo>/blobs/<digest> → repository scope
+        let repo = path
+            .strip_prefix("/v2/")
+            .and_then(|rest| rest.find("/blobs/").map(|i| &rest[..i]))
+            .unwrap_or_default();
+        if repo.is_empty() {
+            return String::new();
+        }
+        let key = (index, repo.to_owned());
+        {
+            let cache = self.token_cache.lock().await;
+            if let Some((token, expires)) = cache.get(&key) {
+                if Instant::now() < *expires {
+                    return token.clone();
+                }
+            }
+        }
+        let mut url = match Url::parse(&spec.token_url) {
+            Ok(url) => url,
+            Err(_) => return String::new(),
+        };
+        {
+            let mut query = url.query_pairs_mut();
+            if !spec.token_service.is_empty() {
+                query.append_pair("service", &spec.token_service);
+            }
+            query.append_pair("scope", &format!("repository:{repo}:pull"));
+        }
+        let fetched = tokio::time::timeout(Duration::from_secs(15), self.client.get(url).send())
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+        // Parse the JSON body manually (reqwest runs without the json
+        // feature); token bodies are small and buffered by reqwest.
+        let parsed = match fetched {
+            Some(response) => match response.text().await {
+                Ok(text) => serde_json::from_str::<serde_json::Value>(&text).ok(),
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let token = parsed
+            .as_ref()
+            .and_then(|v| {
+                v.get("token")
+                    .or_else(|| v.get("access_token"))
+                    .and_then(|t| t.as_str())
+            })
+            .unwrap_or_default()
+            .to_owned();
+        if token.is_empty() {
+            // No usable token: let the chunk 401 and the failure stats push
+            // this source out of rotation.
+            return String::new();
+        }
+        let ttl = parsed
+            .as_ref()
+            .and_then(|v| v.get("expires_in"))
+            .and_then(|e| e.as_u64())
+            .unwrap_or(300)
+            .saturating_sub(30)
+            .max(30);
+        let mut cache = self.token_cache.lock().await;
+        if cache.len() > 4096 {
+            cache.retain(|_, (_, expires)| Instant::now() < *expires);
+        }
+        cache.insert(
+            key,
+            (token.clone(), Instant::now() + Duration::from_secs(ttl)),
+        );
+        token
     }
 
     pub async fn trigger_probe(self: &Arc<Self>) {
@@ -374,18 +464,23 @@ fn parse(text: &str) -> Result<Vec<SourceSpec>> {
         let token = item
             .get("token")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("source missing 'token'"))?;
+            .unwrap_or_default()
+            .to_owned();
         let service = item
             .get("service")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("source missing 'service'"))?
+            .unwrap_or_default()
             .to_owned();
         validate_https(registry)?;
-        validate_https(token)?;
+        // Empty token marks an anonymous mirror that serves blobs without
+        // auth; only auth-style sources need a reachable https token URL.
+        if !token.is_empty() {
+            validate_https(&token)?;
+        }
         out.push(SourceSpec {
             name,
             registry_url: registry.to_owned(),
-            token_url: token.to_owned(),
+            token_url: token,
             token_service: service,
         });
     }
@@ -423,6 +518,54 @@ mod tests {
             token_url: format!("https://{name}.example/token"),
             token_service: name.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn anonymous_source_skips_token_fetch() {
+        let pool = SourcePool::new(
+            reqwest::Client::new(),
+            vec![SourceSpec {
+                name: "anon".into(),
+                registry_url: "https://anon.example".into(),
+                token_url: String::new(),
+                token_service: String::new(),
+            }],
+        );
+        assert_eq!(
+            pool.blob_token(0, "/v2/library/alpine/blobs/sha256:abc")
+                .await,
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn token_cache_hit_avoids_refetch() {
+        let pool = SourcePool::new(reqwest::Client::new(), vec![spec("tok")]);
+        {
+            let mut cache = pool.token_cache.lock().await;
+            cache.insert(
+                (0, "library/alpine".to_owned()),
+                (
+                    "cached-token".to_owned(),
+                    Instant::now() + Duration::from_secs(300),
+                ),
+            );
+        }
+        assert_eq!(
+            pool.blob_token(0, "/v2/library/alpine/blobs/sha256:abc")
+                .await,
+            "cached-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_token_unknown_source_is_empty() {
+        let pool = SourcePool::new(reqwest::Client::new(), vec![spec("only")]);
+        assert_eq!(
+            pool.blob_token(9, "/v2/library/alpine/blobs/sha256:abc")
+                .await,
+            ""
+        );
     }
 
     #[test]

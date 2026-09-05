@@ -105,7 +105,6 @@ pub async fn download(
     stats: Arc<Stats>,
     registry: String,
     path: String,
-    token: String,
     digest: String,
     total_size: u64,
     part_path: PathBuf,
@@ -188,7 +187,6 @@ pub async fn download(
         let total_received = Arc::clone(&total_received);
         let client = client.clone();
         let pool = Arc::clone(&pool);
-        let token = token.clone();
         let path = path.clone();
         let chunk = *chunk;
 
@@ -212,6 +210,9 @@ pub async fn download(
                         continue;
                     }
                 };
+                // Per-source token: mirrors reject tokens issued by a
+                // different registry, and anonymous sources take none.
+                let token = pool.blob_token(source_index, &path).await;
                 let started = Instant::now();
                 match fetch_chunk(
                     &client,
