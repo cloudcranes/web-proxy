@@ -179,6 +179,10 @@ impl SourcePool {
         }
     }
 
+    pub async fn trigger_probe(self: &Arc<Self>) {
+        Self::probe_all_arc(Arc::clone(self)).await;
+    }
+
     async fn recompute_weights(&self) {
         let stats = self.stats.read().await;
         let mut weights = self.weights.write().await;
