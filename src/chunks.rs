@@ -181,12 +181,14 @@ pub async fn download(
             match ordered[next_index].take() {
                 Some(bytes) => {
                     next_offset += bytes.len() as u64;
-                    if let Some(tx) = tx.as_ref() {
-                        if tx.send(Ok(bytes)).await.is_err() {
-                            // Client gone: stop emitting, but keep downloading.
-                            drop(tx);
-                            tx = None;
+                    let mut client_disconnected = false;
+                    if let Some(sender) = tx.as_ref() {
+                        if sender.send(Ok(bytes)).await.is_err() {
+                            client_disconnected = true;
                         }
+                    }
+                    if client_disconnected {
+                        tx = None;
                     }
                 }
                 None => break,
