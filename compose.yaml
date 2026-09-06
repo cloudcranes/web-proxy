@@ -16,6 +16,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     group_add:
       - "${DOCKER_GID:-999}"
+    # Chunk fetches resolve upstream mirror hostnames; flaky LAN router DNS
+    # kills whole downloads, so pin dependable public resolvers.
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
     env_file:
       - .env
     read_only: true
