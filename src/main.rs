@@ -117,6 +117,9 @@ struct AppState {
     /// verification needs a name the certificate actually covers.
     pull_via_host: Option<String>,
     accel_addr: Option<String>,
+    /// Served at GET /ca.crt so LAN clients can import the self-signed CA
+    /// without copying files; unset hides the endpoint.
+    ca_path: Option<String>,
     started: Instant,
 }
 
@@ -246,6 +249,7 @@ async fn main() -> Result<()> {
         pulls: dockerpull::PullManager::new(env_or("DOCKER_SOCKET", "/var/run/docker.sock")),
         pull_via_host: env::var("PULL_VIA_HOST").ok().filter(|v| !v.is_empty()),
         accel_addr: accel_addr.clone(),
+        ca_path: env::var("CA_CERT_PATH").ok().filter(|v| !v.is_empty()),
         started: Instant::now(),
     });
 
@@ -256,6 +260,7 @@ async fn main() -> Result<()> {
         .route("/downloads", get(downloads))
         .route("/pull", post(start_pull))
         .route("/pulls", get(list_pulls))
+        .route("/ca.crt", get(serve_ca))
         .route("/sources", get(sources_view))
         .route("/sources/probe", post(trigger_probe))
         .route("/cache/clear", post(clear_cache))
@@ -548,6 +553,26 @@ async fn downloads(State(state): State<Arc<AppState>>) -> Response {
 
 async fn dashboard_redirect() -> Response {
     Redirect::temporary("/dashboard").into_response()
+}
+
+async fn serve_ca(State(state): State<Arc<AppState>>) -> Response {
+    let Some(path) = &state.ca_path else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::fs::read(path).await {
+        Ok(bytes) => (
+            [
+                (CONTENT_TYPE, "application/x-x509-ca-cert"),
+                (
+                    HeaderName::from_static("content-disposition"),
+                    HeaderValue::from_static("attachment; filename=\"web-proxy-ca.crt\""),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn start_pull(State(state): State<Arc<AppState>>, request: Request) -> Response {
