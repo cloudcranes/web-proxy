@@ -179,7 +179,13 @@
       try {
         const r = await fetch('/cache/clear', { method: 'POST' });
         const j = await r.json();
-        if (r.ok) { say('已清空，释放 ' + fmtBytes(j.freed_bytes || 0)); loadStats(); }
+        if (r.ok) {
+          const warn = j.active_downloads
+            ? '（' + j.active_downloads + ' 个下载进行中，其进度将作废）'
+            : '';
+          say('已清空，释放 ' + fmtBytes(j.freed_bytes || 0) + warn, !!warn);
+          loadStats();
+        }
         else say('清空失败: HTTP ' + r.status, true);
       } catch (e) { say('清空失败: ' + e, true); }
       finally { btn.disabled = false; }

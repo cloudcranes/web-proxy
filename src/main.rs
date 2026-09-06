@@ -585,11 +585,16 @@ async fn trigger_probe(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn clear_cache(State(state): State<Arc<AppState>>) -> Response {
+    // Clearing while a chunked download is mid-flight deletes its .part and
+    // dooms that transfer's commit (the client retry self-heals), so surface
+    // the count instead of failing the request.
+    let active = state.stats.active_downloads.lock().await.len();
     let freed_bytes = state.cache.clear().await;
     state.manifests.clear().await;
     let body = serde_json::json!({
         "status": "cleared",
         "freed_bytes": freed_bytes,
+        "active_downloads": active,
     });
     ([(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }
