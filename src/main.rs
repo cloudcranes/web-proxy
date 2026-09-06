@@ -562,7 +562,10 @@ async fn serve_ca(State(state): State<Arc<AppState>>) -> Response {
     match tokio::fs::read(path).await {
         Ok(bytes) => (
             [
-                (CONTENT_TYPE, "application/x-x509-ca-cert"),
+                (
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-x509-ca-cert"),
+                ),
                 (
                     HeaderName::from_static("content-disposition"),
                     HeaderValue::from_static("attachment; filename=\"web-proxy-ca.crt\""),
