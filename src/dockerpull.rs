@@ -21,6 +21,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use hyper::{Method, Request as HyperRequest, StatusCode as HyperStatusCode};
+use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -757,7 +758,7 @@ pub(crate) async fn docker_api(
     body: Option<serde_json::Value>,
     timeout_secs: u64,
 ) -> Result<serde_json::Value> {
-    use http_body_util::{BodyExt, Empty, Full};
+    use http_body_util::BodyExt;
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
     use serde_json::Value;
@@ -816,7 +817,7 @@ pub(crate) async fn docker_api(
 
 /// The gateway's own container id: the container hostname is a short id.
 #[cfg(unix)]
-pub(crate) async fn self_container_id(socket: &str) -> Result<String> {
+pub(crate) async fn self_container_id(_socket: &str) -> Result<String> {
     let id = tokio::fs::read_to_string("/etc/hostname")
         .await
         .context("read /etc/hostname")?

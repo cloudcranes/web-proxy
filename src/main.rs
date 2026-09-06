@@ -681,11 +681,6 @@ async fn issue_cert(State(state): State<Arc<AppState>>) -> Response {
     if self_id.is_empty() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "无法确定自身容器 ID\n").into_response();
     }
-    let cache_dir = state
-        .settings_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
     let image_ref = format!(
         "{}/neilpang/acme.sh:latest",
         settings
@@ -869,7 +864,7 @@ async fn create_dns_records(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-async fn restart_gateway(State(state): State<Arc<AppState>>) -> Response {
+async fn restart_gateway(State(_state): State<Arc<AppState>>) -> Response {
     let socket = env_or("DOCKER_SOCKET", "/var/run/docker.sock");
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(800)).await;
