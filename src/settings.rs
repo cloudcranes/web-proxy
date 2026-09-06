@@ -258,14 +258,17 @@ mod tests {
 
     #[test]
     fn patch_only_touches_present_fields() {
+        let tmp = std::env::temp_dir().join("wp-settings-patch-test.json");
+        let _ = std::fs::remove_file(&tmp);
         let base = Settings {
             domain: Some("old.example".into()),
             ..Default::default()
         };
         let patch = patch_from_body(&json!({ "domain": "new.example" }));
-        let merged = base.apply(patch, Path::new("/nonexistent/x.json")).unwrap();
+        let merged = base.apply(patch, &tmp).unwrap();
         assert_eq!(merged.domain.as_deref(), Some("new.example"));
         assert_eq!(merged.cf_token, None);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
