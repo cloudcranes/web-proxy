@@ -396,36 +396,54 @@ async fn serve_multi(
     app: Router,
     drain_timeout: u64,
 ) -> Result<()> {
+    // FuturesUnordered drops a future once it yields, so every accept must
+    // re-arm its listener before the next loop turn or the accept loop dies
+    // after exactly one connection per port.
+    let scheme = if acceptor.is_some() { "https" } else { "http" };
+    for listener in listeners.iter() {
+        match listener.local_addr() {
+            Ok(addr) => info!(listen = %addr, %scheme, "listening"),
+            Err(error) => warn!(%error, "local_addr unavailable"),
+        }
+    }
     let mut accepts = futures_util::stream::FuturesUnordered::new();
     for (i, listener) in listeners.iter().enumerate() {
         let listeners = Arc::clone(&listeners);
-        accepts.push(async move { listeners[i].accept().await });
+        accepts.push(async move { (i, listener.accept().await) });
     }
     let mut conns: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
-        tokio::select! {
-            Some(accepted) = accepts.next() => {
-                let (stream, _peer) = accepted.context("accept connection")?;
-                let app = app.clone();
-                let acceptor = acceptor.clone();
-                conns.spawn(async move {
-                    match acceptor {
-                        Some(acceptor) => {
-                            let tls = match acceptor.accept(stream).await {
-                                Ok(tls) => tls,
-                                Err(error) => {
-                                    warn!(%error, "TLS handshake failed");
-                                    return;
-                                }
-                            };
-                            serve_conn(TokioIo::new(tls), app, drain_timeout).await;
-                        }
-                        None => serve_conn(TokioIo::new(stream), app, drain_timeout).await,
-                    }
-                });
-            }
+        let (i, accepted) = tokio::select! {
+            Some(pair) = accepts.next(), if !accepts.is_empty() => pair,
             _ = shutdown_signal() => break,
-        }
+        };
+        let listeners = Arc::clone(&listeners);
+        accepts.push(async move { (i, listeners[i].accept().await) });
+
+        let (stream, _peer) = match accepted {
+            Ok(pair) => pair,
+            Err(error) => {
+                warn!(%error, "accept failed");
+                continue;
+            }
+        };
+        let app = app.clone();
+        let acceptor = acceptor.clone();
+        conns.spawn(async move {
+            match acceptor {
+                Some(acceptor) => {
+                    let tls = match acceptor.accept(stream).await {
+                        Ok(tls) => tls,
+                        Err(error) => {
+                            warn!(%error, "TLS handshake failed");
+                            return;
+                        }
+                    };
+                    serve_conn(TokioIo::new(tls), app, drain_timeout).await;
+                }
+                None => serve_conn(TokioIo::new(stream), app, drain_timeout).await,
+            }
+        });
     }
     // Mirror the HTTP path's drain: let in-flight blob transfers finish (or
     // hit the shared drain deadline) instead of killing the runtime at once.
