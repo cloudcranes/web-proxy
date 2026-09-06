@@ -776,19 +776,21 @@ pub(crate) async fn docker_api(
         .method(method)
         .uri(path_and_query)
         .header("host", "docker");
-    // Two body types branch here, so build the request once per arm into a
-    // single concrete type instead of trying to unify them.
+    // Empty and full bodies are different types, so always build a
+    // Full<Bytes> request (empty payload for bodyless calls).
     let request = match body {
-        Some(value) => builder
-            .header("content-type", "application/json")
-            .body(http_body_util::Full::new(axum::body::Bytes::from(
-                value.to_string(),
-            )))
-            .context("build docker api request")?,
+        Some(value) => {
+            builder
+                .header("content-type", "application/json")
+                .body(http_body_util::Full::new(axum::body::Bytes::from(
+                    value.to_string(),
+                )))
+        }
         None => builder
-            .body(http_body_util::Empty::<axum::body::Bytes>::new())
-            .context("build docker api request")?,
-    };
+            .header("content-length", "0")
+            .body(http_body_util::Full::new(axum::body::Bytes::new())),
+    }
+    .context("build docker api request")?;
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
         sender.send_request(request),
