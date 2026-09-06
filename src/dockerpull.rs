@@ -327,6 +327,7 @@ async fn docker_pull(socket: &str, job: &PullJob) -> Result<String> {
             Err(_) => bail!("docker pull stream idle for {PULL_IDLE_TIMEOUT:?}"),
         };
         let Some(frame) = frame else { break };
+        let frame = frame?;
         let data = frame
             .into_data()
             .map_err(|_| anyhow::anyhow!("non-data frame"))?;
