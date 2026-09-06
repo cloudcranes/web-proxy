@@ -116,6 +116,7 @@ struct AppState {
     /// header can be wrong (localhost, EdgeOne domain), and the daemon's TLS
     /// verification needs a name the certificate actually covers.
     pull_via_host: Option<String>,
+    accel_addr: Option<String>,
     started: Instant,
 }
 
@@ -135,6 +136,9 @@ async fn main() -> Result<()> {
         .init();
 
     let listen_addr = env_or("LISTEN_ADDR", "0.0.0.0:20516");
+    let accel_addr = env::var("ACCEL_LISTEN_ADDR")
+        .ok()
+        .filter(|value| !value.is_empty());
     let dockerhub = registry_config(
         "DOCKERHUB",
         "https://registry-1.docker.io",
@@ -241,6 +245,7 @@ async fn main() -> Result<()> {
         stats: Arc::new(Stats::default()),
         pulls: dockerpull::PullManager::new(env_or("DOCKER_SOCKET", "/var/run/docker.sock")),
         pull_via_host: env::var("PULL_VIA_HOST").ok().filter(|v| !v.is_empty()),
+        accel_addr: accel_addr.clone(),
         started: Instant::now(),
     });
 
@@ -261,16 +266,24 @@ async fn main() -> Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
+    // Daily access (dashboard/management) and acceleration (docker pulls,
+    // git proxy) can live on separate ports; both serve the same router.
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
+    let mut listeners = vec![listener];
+    if let Some(accel) = &accel_addr {
+        let listener = tokio::net::TcpListener::bind(accel)
+            .await
+            .with_context(|| format!("bind accel {accel}"))?;
+        listeners.push(listener);
+        info!(%accel, "listening (acceleration port)");
+    }
 
-    if let Some(acceptor) = tls_acceptor {
-        info!(%listen_addr, "listening (TLS)");
-        serve_tls(listener, app, acceptor, drain_timeout).await?;
-    } else {
+    if listeners.len() == 1 && tls_acceptor.is_none() {
         info!(%listen_addr, "listening (HTTP)");
-        let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+        let server =
+            axum::serve(listeners.remove(0), app).with_graceful_shutdown(shutdown_signal());
         tokio::select! {
             result = server => result.context("serve HTTP")?,
             // Cap how long in-flight blob transfers may hold the process after
@@ -280,6 +293,8 @@ async fn main() -> Result<()> {
                 warn!(drain_timeout_secs = drain_timeout, "drain timeout exceeded; closing remaining connections");
             }
         }
+    } else {
+        serve_multi(Arc::new(listeners), tls_acceptor, app, drain_timeout).await?;
     }
     Ok(())
 }
@@ -372,28 +387,41 @@ fn pem_der_blocks(pem: &str, label: &str) -> Vec<Vec<u8>> {
     ders
 }
 
-async fn serve_tls(
-    listener: tokio::net::TcpListener,
+/// Serve one or more listeners with the same router, wrapping connections in
+/// TLS when an acceptor is configured. Used whenever an acceleration port is
+/// configured or TLS is on; the plain single-port HTTP path keeps axum::serve.
+async fn serve_multi(
+    listeners: Arc<Vec<tokio::net::TcpListener>>,
+    acceptor: Option<TlsAcceptor>,
     app: Router,
-    acceptor: TlsAcceptor,
     drain_timeout: u64,
 ) -> Result<()> {
+    let mut accepts = futures_util::stream::FuturesUnordered::new();
+    for (i, listener) in listeners.iter().enumerate() {
+        let listeners = Arc::clone(&listeners);
+        accepts.push(async move { listeners[i].accept().await });
+    }
     let mut conns: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _peer) = accepted.context("accept TLS connection")?;
-                let acceptor = acceptor.clone();
+            Some(accepted) = accepts.next() => {
+                let (stream, _peer) = accepted.context("accept connection")?;
                 let app = app.clone();
+                let acceptor = acceptor.clone();
                 conns.spawn(async move {
-                    let tls = match acceptor.accept(stream).await {
-                        Ok(tls) => tls,
-                        Err(error) => {
-                            warn!(%error, "TLS handshake failed");
-                            return;
+                    match acceptor {
+                        Some(acceptor) => {
+                            let tls = match acceptor.accept(stream).await {
+                                Ok(tls) => tls,
+                                Err(error) => {
+                                    warn!(%error, "TLS handshake failed");
+                                    return;
+                                }
+                            };
+                            serve_conn(TokioIo::new(tls), app, drain_timeout).await;
                         }
-                    };
-                    serve_tls_conn(TokioIo::new(tls), app, drain_timeout).await;
+                        None => serve_conn(TokioIo::new(stream), app, drain_timeout).await,
+                    }
                 });
             }
             _ = shutdown_signal() => break,
@@ -411,18 +439,17 @@ async fn serve_tls(
     } {
         if let Err(error) = joined {
             if !error.is_cancelled() {
-                warn!(%error, "TLS connection task failed");
+                warn!(%error, "connection task failed");
             }
         }
     }
     Ok(())
 }
 
-async fn serve_tls_conn(
-    io: TokioIo<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
-    app: Router,
-    drain_timeout: u64,
-) {
+async fn serve_conn<I>(io: TokioIo<I>, app: Router, drain_timeout: u64)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     // axum's Router speaks Service<Request<Body>>, hyper feeds Request<Incoming>:
     // bridge the body types per request via service_fn + oneshot.
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
@@ -434,7 +461,7 @@ async fn serve_tls_conn(
     tokio::select! {
         result = conn.as_mut() => {
             if let Err(error) = result {
-                warn!(%error, "TLS connection error");
+                warn!(%error, "connection error");
             }
         }
         _ = shutdown_signal() => {
@@ -442,7 +469,7 @@ async fn serve_tls_conn(
             tokio::select! {
                 result = conn.as_mut() => {
                     if let Err(error) = result {
-                        warn!(%error, "TLS connection error during drain");
+                        warn!(%error, "connection error during drain");
                     }
                 }
                 _ = drain_deadline(drain_timeout) => {
@@ -476,6 +503,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Response {
         "version": env!("CARGO_PKG_VERSION"),
         "chunk_mib": chunk_mib / 1024 / 1024,
         "chunk_concurrency": chunk_concurrency,
+        "accel_addr": state.accel_addr,
     });
     ([(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }

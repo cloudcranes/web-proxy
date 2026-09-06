@@ -22,7 +22,8 @@
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `LISTEN_ADDR` | 否 | `0.0.0.0:20516` | 监听地址 |
+| `LISTEN_ADDR` | 否 | `0.0.0.0:20516` | 监听地址（日常访问：面板/管理） |
+| `ACCEL_LISTEN_ADDR` | 否 | 不启用 | 加速端口（docker 拉取 / GitHub 代理），与主端口同协议；两端口服务同一套路由 |
 | `CACHE_DIR` | 否 | `/data` | blob 缓存目录（compose 已挂数据卷） |
 | `CACHE_MAX_GB` | 否 | `10` | blob 缓存容量上限 |
 | `MANIFEST_TTL_SECS` | 否 | `60` | manifest 内存缓存 TTL |

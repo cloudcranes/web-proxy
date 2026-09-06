@@ -205,6 +205,7 @@
     <div>
       <div class="side-stat"><span>上游源</span></div>
       <div class="src-lamps" id="s-lamps"></div>
+      <div class="side-stat" id="s-accelrow" style="display:none"><span>加速端口</span><b class="mono" id="s-accel">–</b></div>
     </div>
     <div class="grow"></div>
     <div class="side-actions">
@@ -532,6 +533,11 @@
       document.getElementById('s-ver').textContent = 'v' + s.version + ' · 每 5s 刷新';
       const pct = s.disk_cap_bytes ? Math.min(100, s.disk_bytes * 100 / s.disk_cap_bytes) : 0;
       document.getElementById('s-diskbar').style.width = pct + '%';
+      const accelRow = document.getElementById('s-accelrow');
+      if (s.accel_addr) {
+        accelRow.style.display = 'flex';
+        document.getElementById('s-accel').textContent = ':' + String(s.accel_addr).split(':').pop();
+      }
     }).catch(() => {});
   }
 
