@@ -406,10 +406,20 @@ async fn serve_multi(
             Err(error) => warn!(%error, "local_addr unavailable"),
         }
     }
-    let mut accepts = futures_util::stream::FuturesUnordered::new();
+    type AcceptFuture = std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = (
+                        usize,
+                        std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>,
+                    ),
+                > + Send,
+        >,
+    >;
+    let mut accepts = futures_util::stream::FuturesUnordered::<AcceptFuture>::new();
     for (i, listener) in listeners.iter().enumerate() {
         let listeners = Arc::clone(&listeners);
-        accepts.push(async move { (i, listener.accept().await) });
+        accepts.push(Box::pin(async move { (i, listeners[i].accept().await) }));
     }
     let mut conns: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
@@ -418,7 +428,7 @@ async fn serve_multi(
             _ = shutdown_signal() => break,
         };
         let listeners = Arc::clone(&listeners);
-        accepts.push(async move { (i, listeners[i].accept().await) });
+        accepts.push(Box::pin(async move { (i, listeners[i].accept().await) }));
 
         let (stream, _peer) = match accepted {
             Ok(pair) => pair,
