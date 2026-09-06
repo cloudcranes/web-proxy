@@ -499,16 +499,33 @@ async fn start_pull(State(state): State<Arc<AppState>>, request: Request) -> Res
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     // The daemon must reach us to pull. Prefer the explicit PULL_VIA_HOST;
-    // the request Host header is only a fallback (it can be localhost or a
-    // proxied domain, neither of which the daemon can verify/reach).
-    let gateway_host = state.pull_via_host.clone().unwrap_or_else(|| {
-        request
-            .headers()
-            .get(HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("127.0.0.1")
-            .to_owned()
-    });
+    // without it, accept the request Host header only when it names this
+    // machine (loopback or IP literal). An attacker-chosen domain would turn
+    // the daemon into a puller of arbitrary external registries, and the
+    // retag step would then present those images as locally-expected names.
+    let gateway_host = match &state.pull_via_host {
+        Some(host) => host.clone(),
+        None => {
+            let header = request
+                .headers()
+                .get(HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("127.0.0.1");
+            let name = header
+                .rsplit_once(':')
+                .map(|(name, _)| name.trim_start_matches('[').trim_end_matches(']'))
+                .unwrap_or(header);
+            if name == "localhost" || name.parse::<IpAddr>().is_ok() {
+                header.to_owned()
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "refusing Host header that is not an IP literal; set PULL_VIA_HOST\n",
+                )
+                    .into_response();
+            }
+        }
+    };
     let bytes = match request.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid body\n").into_response(),
@@ -579,7 +596,18 @@ async fn clear_cache(State(state): State<Arc<AppState>>) -> Response {
 
 async fn dashboard() -> Response {
     let body = include_str!("../assets/dashboard.html");
-    ([(CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
+    // The page renders upstream-controlled strings; the CSP is a backstop
+    // for any injection the escaping misses. Inline script/style are this
+    // single-file page's own.
+    let csp = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'";
+    (
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8"),
+            (HeaderName::from_static("content-security-policy"), csp),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 async fn proxy(
@@ -756,7 +784,10 @@ async fn proxy_manifest(
         .filter_map(|value| value.to_str().ok())
         .collect::<Vec<_>>()
         .join(", ");
-    let key = (path.clone(), accept);
+    // The same path can arrive for two registries (ghcr.io prefix is
+    // stripped, bare mirror mode is docker.io) — scope the cache key by
+    // registry so one cannot serve the other's manifests.
+    let key = (registry.route_prefix().to_owned() + &path, accept);
 
     if let Some(hit) = state.manifests.get(&key).await {
         return manifest_response(&hit, head);

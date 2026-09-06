@@ -24,7 +24,7 @@
     .card .sub { color: var(--muted); font-size: .72rem; margin-top: .15rem; }
     .meter { height: 6px; background: var(--panel2); border-radius: 3px; margin-top: .5rem; overflow: hidden; }
     .meter > div { height: 100%; background: var(--accent); width: 0; transition: width .6s; }
-    section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1rem; margin-bottom: 1.2rem; }
+    section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1rem; margin-bottom: 1.2rem; overflow-x: auto; }
     section h2 { font-size: .85rem; margin: 0 0 .6rem; color: var(--muted); font-weight: normal; letter-spacing: .05em; }
     table { border-collapse: collapse; width: 100%; font-size: .85rem; }
     th, td { padding: 5px 10px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
@@ -108,6 +108,7 @@
     <h2>镜像拉取（经本网关加速，完成后自动重命名为原始名称）</h2>
     <div style="display:flex; gap:.5rem; margin-bottom:.8rem; flex-wrap:wrap;">
       <input id="pull-input" placeholder="例如 redis:alpine、bitnami/wordpress、ghcr.io/owner/img:tag"
+             onkeydown="if (event.key === 'Enter') doPull()"
              style="flex:1; min-width:260px; font:inherit; padding:6px 10px; color:var(--fg);
                     background:var(--panel2); border:1px solid var(--line); border-radius:5px;">
       <button id="btn-pull" onclick="doPull()">拉取</button>
@@ -141,6 +142,7 @@
   </footer>
 
   <script>
+    const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     function fmtBytes(n) {
       if (!isFinite(n)) return '–';
       if (n < 1024) return n + ' B';
@@ -213,8 +215,8 @@
           const pct = d.total ? Math.min(100, d.bytes_done * 100 / d.total) : 0;
           const tr = document.createElement('tr');
           tr.innerHTML =
-            '<td>' + d.path + '</td>' +
-            '<td class="muted">' + String(d.digest).slice(7, 19) + '…</td>' +
+            '<td>' + esc(d.path) + '</td>' +
+            '<td class="muted">' + esc(String(d.digest).slice(7, 19)) + '…</td>' +
             '<td><div class="dbar"><div style="width:' + pct + '%"></div></div></td>' +
             '<td>' + fmtBytes(d.bytes_done) + ' / ' + fmtBytes(d.total) + '</td>' +
             '<td>' + d.chunks_done + ' / ' + d.chunks_total + '</td>' +
@@ -228,10 +230,16 @@
       fetch('/sources').then(r => r.json()).then(rows => {
         const tb = document.getElementById('sources');
         tb.innerHTML = '<tr><th>源</th><th>权重</th><th>p50 ms</th><th>吞吐</th><th>成功 / 失败</th><th>Range</th><th>最近活动</th></tr>';
+        if (!rows.length) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = '<td colspan="7" class="muted">暂无上游源</td>';
+          tb.appendChild(tr);
+          return;
+        }
         rows.forEach(r => {
           const tr = document.createElement('tr');
           tr.innerHTML =
-            '<td>' + r.name + '</td>' +
+            '<td>' + esc(r.name) + '</td>' +
             '<td>' + r.weight.toFixed(3) + '</td>' +
             '<td>' + r.p50_ms + '</td>' +
             '<td>' + (r.throughput_bps ? fmtBytes(r.throughput_bps) + '/s' : '–') + '</td>' +
@@ -244,9 +252,23 @@
     }
     const GH_HOSTS = ['github.com','api.github.com','raw.githubusercontent.com','codeload.github.com','gist.github.com','gist.githubusercontent.com','objects.githubusercontent.com','release-assets.githubusercontent.com','pkg-containers.githubusercontent.com'];
     function copyEl(id) {
-      navigator.clipboard.writeText(document.getElementById(id).textContent)
-        .then(() => say('已复制'))
-        .catch(() => say('复制失败', true));
+      const text = document.getElementById(id).textContent;
+      // navigator.clipboard exists only in secure contexts; plain-HTTP LAN
+      // deployments fall back to a hidden textarea + execCommand.
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => say('已复制')).catch(() => say('复制失败', true));
+        return;
+      }
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand('copy') ? say('已复制') : say('复制失败', true);
+      } catch (e) { say('复制失败', true); }
+      document.body.removeChild(ta);
     }
     function convertGh() {
       const raw = document.getElementById('gh-input').value.trim();
@@ -270,8 +292,9 @@
       // 仓库主链接额外给 git clone 命令（tree/blob 子路径没有 clone 意义）
       const m = url.pathname.match(/^\/([^/]+)\/([^/]+?)\/?$/);
       if (url.hostname === 'github.com' && m) {
+        // Already-".git"-suffixed links must not grow a second suffix.
         document.getElementById('gh-git').textContent =
-          'git clone ' + location.origin + '/github.com/' + m[1] + '/' + m[2] + '.git';
+          'git clone ' + location.origin + '/github.com/' + m[1] + '/' + m[2].replace(/\.git$/, '') + '.git';
         gitrow.style.display = 'flex';
       }
     }
@@ -287,9 +310,12 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ image }),
         });
-        const j = await r.json().catch(() => ({}));
+        // Errors come back as text/plain; successes as JSON.
+        const text = await r.text();
+        let j = {};
+        try { j = JSON.parse(text); } catch (e) { /* plain-text error */ }
         if (r.ok) { say('已加入拉取队列: ' + (j.image || image)); input.value = ''; loadPulls(); }
-        else say('拉取请求失败: ' + (j.error || j.message || ('HTTP ' + r.status) || JSON.stringify(j)), true);
+        else say('拉取请求失败: ' + (text.trim() || ('HTTP ' + r.status)), true);
       } catch (e) { say('拉取请求失败: ' + e, true); }
       finally { btn.disabled = false; }
     }
@@ -304,19 +330,19 @@
           div.className = 'pulljob';
           const layers = (job.layers || []).map(l => {
             const pct = l.total ? Math.min(100, l.current * 100 / l.total) : (l.status.includes('complete') || l.status.includes('Exists') ? 100 : 0);
-            return '<div class="lrow"><span class="lid">' + l.id + '</span>' +
+            return '<div class="lrow"><span class="lid">' + esc(l.id) + '</span>' +
                    '<div class="lbar"><div style="width:' + pct + '%"></div></div>' +
-                   '<span class="lpct">' + l.status + (l.total ? ' ' + fmtBytes(l.current) + '/' + fmtBytes(l.total) : '') + '</span></div>';
+                   '<span class="lpct">' + esc(l.status) + (l.total ? ' ' + fmtBytes(l.current) + '/' + fmtBytes(l.total) : '') + '</span></div>';
           }).join('');
           div.innerHTML =
             '<div class="row">' +
-              '<span class="name">' + job.image + '</span>' +
+              '<span class="name">' + esc(job.image) + '</span>' +
               '<span class="badge ' + (STATUS_BADGE[job.status] || 'pulling') + '">' + job.status + '</span>' +
               '<div class="dbar"><div style="width:' + (job.percent || 0) + '%"></div></div>' +
               '<span class="muted">' + (job.percent || 0) + '% · ' + fmtDur(job.elapsed_secs) + '</span>' +
             '</div>' +
-            (job.message ? '<div class="muted" style="font-size:.78rem;margin-top:.25rem">' + job.message + '</div>' : '') +
-            (job.error ? '<div class="err">' + job.error + '</div>' : '') +
+            (job.message ? '<div class="muted" style="font-size:.78rem;margin-top:.25rem">' + esc(job.message) + '</div>' : '') +
+            (job.error ? '<div class="err">' + esc(job.error) + '</div>' : '') +
             (layers ? '<div class="layers">' + layers + '</div>' : '');
           box.appendChild(div);
         });

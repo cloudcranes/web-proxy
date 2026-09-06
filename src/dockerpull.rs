@@ -317,8 +317,17 @@ async fn docker_pull(socket: &str, job: &PullJob) -> Result<String> {
 
     let mut body = response.into_body();
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(frame) = BodyExt::frame(&mut body).await {
-        let data = frame?
+    // Per-frame idle timeout: a hung daemon must not wedge the job (and
+    // thereby block re-pulls of the same image) forever. Normal pulls emit
+    // progress frames every few seconds.
+    const PULL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+    loop {
+        let frame = match tokio::time::timeout(PULL_IDLE_TIMEOUT, BodyExt::frame(&mut body)).await {
+            Ok(frame) => frame,
+            Err(_) => bail!("docker pull stream idle for {PULL_IDLE_TIMEOUT:?}"),
+        };
+        let Some(frame) = frame else { break };
+        let data = frame
             .into_data()
             .map_err(|_| anyhow::anyhow!("non-data frame"))?;
         buf.extend_from_slice(&data);
@@ -360,8 +369,10 @@ async fn docker_retag(socket: &str, job: &PullJob) -> Result<()> {
         ),
     };
     let uri = format!(
-        "/images/{}/tag?repo={repo}&tag={tag}",
+        "/images/{}/tag?repo={}&tag={}",
         percent_encode_path(&pulled),
+        percent_encode_path(repo),
+        percent_encode_path(tag),
     );
 
     let stream = tokio::net::UnixStream::connect(socket)
@@ -461,20 +472,6 @@ pub fn parse_image_ref(input: &str) -> Result<ParsedImageRef> {
     if registry != "docker.io" && registry != "ghcr.io" {
         bail!("unsupported registry {registry} (gateway routes docker.io and ghcr.io only)");
     }
-    if path.is_empty()
-        || path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-    {
-        bail!("invalid image path");
-    }
-    if path
-        .chars()
-        .any(|c| c.is_ascii_uppercase() || c.is_whitespace())
-    {
-        bail!("image names must be lowercase without whitespace");
-    }
-
     // Tag: a ':' after the last '/'. A ':' inside the registry host (e.g.
     // "localhost:5000/foo") yields a pseudo-tag containing '/', which is not
     // a tag.
@@ -482,6 +479,22 @@ pub fn parse_image_ref(input: &str) -> Result<ParsedImageRef> {
         Some((name, tag)) if !tag.contains('/') => (name, Some(tag.to_owned())),
         _ => (path, None),
     };
+    if path.is_empty()
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        bail!("invalid image path");
+    }
+    // Docker's own charset for repository names. Anything outside it
+    // (HTML metacharacters, query separators, whitespace, uppercase) is
+    // rejected before the value can reach a shell, URI, or the dashboard.
+    if !path
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-' | '/'))
+    {
+        bail!("image names may only contain [a-z0-9._-/]");
+    }
     if let Some(tag) = &tag {
         if tag.is_empty()
             || tag.len() > 128
@@ -518,8 +531,11 @@ pub fn parse_image_ref(input: &str) -> Result<ParsedImageRef> {
 /// gateway host from the request (so the daemon pulls through us).
 pub fn plan_pull(image: &str, gateway_host: &str) -> Result<PullSpec> {
     let parsed = parse_image_ref(image)?;
+    // ghcr pulls must keep the ghcr.io/ prefix in the reference so the
+    // daemon's requests hit the gateway's ghcr route instead of being
+    // treated as a bare docker.io mirror path.
     let pull_repo = match parsed.registry.as_str() {
-        "docker.io" => format!("{gateway_host}/{}", parsed.path),
+        "ghcr.io" => format!("{gateway_host}/ghcr.io/{}", parsed.path),
         _ => format!("{gateway_host}/{}", parsed.path),
     };
     // A digest-only pull cannot be retagged to a tag, so leave the image
@@ -619,6 +635,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_paths_outside_docker_charset() {
+        // HTML metacharacters, query separators, and percent signs must be
+        // rejected before they can reach URIs or the dashboard.
+        for bad in [
+            "a<img/src=x/onerror=alert(1)>b",
+            "a&repo=x/c",
+            "a%2Fb",
+            "a?b=c",
+            "a#b/c",
+        ] {
+            assert!(parse_image_ref(bad).is_err(), "expected {bad:?} to fail");
+        }
+        // The legit charset keeps working.
+        assert!(parse_image_ref("bitnami/wordpress-php8.3_fpm").is_ok());
+    }
+
+    #[test]
     fn plans_gateway_pull_with_retag() {
         let plan = plan_pull("redis:alpine", "192.168.1.107:20516").unwrap();
         assert_eq!(plan.pull_repo, "192.168.1.107:20516/library/redis");
@@ -631,7 +664,9 @@ mod tests {
     #[test]
     fn plans_ghcr_pull_through_prefix_route() {
         let plan = plan_pull("ghcr.io/owner/img", "192.168.1.107:20516").unwrap();
-        assert_eq!(plan.pull_repo, "192.168.1.107:20516/owner/img");
+        // The ghcr.io prefix must survive into the pull reference, otherwise
+        // the daemon's /v2/owner/img requests are routed to Docker Hub.
+        assert_eq!(plan.pull_repo, "192.168.1.107:20516/ghcr.io/owner/img");
         assert_eq!(plan.retag_repo.as_deref(), Some("ghcr.io/owner/img"));
         assert_eq!(plan.retag_tag.as_deref(), Some("latest"));
     }

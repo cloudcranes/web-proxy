@@ -59,6 +59,8 @@ impl ActiveDownload {
 }
 
 /// Removes the download entry when the download task ends, however it ends.
+/// Insertion and removal are async (never try_lock): a contended map must
+/// not leak a zombie entry the dashboard would show forever.
 pub struct ActiveDownloadGuard {
     stats: Arc<Stats>,
     hex: String,
@@ -66,12 +68,14 @@ pub struct ActiveDownloadGuard {
 }
 
 impl ActiveDownloadGuard {
-    pub fn new(stats: Arc<Stats>, download: ActiveDownload) -> Self {
+    pub async fn new(stats: Arc<Stats>, download: ActiveDownload) -> Self {
         let hex = download.digest.trim_start_matches("sha256:").to_owned();
         let handle = Arc::new(download);
-        if let Ok(mut map) = stats.active_downloads.try_lock() {
-            map.insert(hex.clone(), Arc::clone(&handle));
-        }
+        stats
+            .active_downloads
+            .lock()
+            .await
+            .insert(hex.clone(), Arc::clone(&handle));
         Self { stats, hex, handle }
     }
 
@@ -82,9 +86,20 @@ impl ActiveDownloadGuard {
 
 impl Drop for ActiveDownloadGuard {
     fn drop(&mut self) {
-        if let Ok(mut map) = self.stats.active_downloads.try_lock() {
-            map.remove(&self.hex);
-        }
+        let stats = Arc::clone(&self.stats);
+        let hex = self.hex.clone();
+        let handle = Arc::clone(&self.handle);
+        tokio::spawn(async move {
+            let mut map = stats.active_downloads.lock().await;
+            // Only remove the entry still owned by this download: a same-
+            // digest retry may already have registered a fresh one.
+            if map
+                .get(&hex)
+                .is_some_and(|existing| Arc::ptr_eq(existing, &handle))
+            {
+                map.remove(&hex);
+            }
+        });
     }
 }
 
@@ -133,7 +148,12 @@ impl DiskCache {
             };
             while let Ok(Some(entry)) = files.next_entry().await {
                 if let Ok(meta) = entry.metadata().await {
-                    if meta.is_file() && !entry.path().extension().is_some_and(|e| e == "part") {
+                    if meta.is_file()
+                        && !entry
+                            .path()
+                            .extension()
+                            .is_some_and(|e| e == "part" || e == "bitmap")
+                    {
                         total += meta.len();
                     }
                 }
@@ -160,7 +180,12 @@ impl DiskCache {
             };
             while let Ok(Some(entry)) = files.next_entry().await {
                 if let Ok(meta) = entry.metadata().await {
-                    if meta.is_file() && !entry.path().extension().is_some_and(|e| e == "part") {
+                    if meta.is_file()
+                        && !entry
+                            .path()
+                            .extension()
+                            .is_some_and(|e| e == "part" || e == "bitmap")
+                    {
                         count += 1;
                     }
                 }
@@ -237,7 +262,9 @@ impl DiskCache {
                     continue;
                 }
                 let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                if path.extension().is_some_and(|e| e == "part")
+                if path
+                    .extension()
+                    .is_some_and(|e| e == "part" || e == "bitmap")
                     && modified.elapsed().unwrap_or_default() < PART_MAX_AGE
                 {
                     continue;

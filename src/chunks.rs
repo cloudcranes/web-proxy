@@ -75,7 +75,11 @@ struct ExistingBitmap {
     done: Vec<bool>,
 }
 
-async fn load_bitmap(bitmap_path: &Path) -> Option<ExistingBitmap> {
+/// Read an existing bitmap sidecar, trusting it only if the part file's
+/// current length actually covers every chunk marked done. A part file that
+/// was evicted (or truncated) while the sidecar survived would otherwise
+/// poison every future attempt for this digest with unfillable holes.
+async fn load_bitmap(bitmap_path: &Path, part_len: u64, total_size: u64) -> Option<ExistingBitmap> {
     let bytes = tokio::fs::read(bitmap_path).await.ok()?;
     if bytes.len() < 8 {
         return None;
@@ -85,6 +89,14 @@ async fn load_bitmap(bitmap_path: &Path) -> Option<ExistingBitmap> {
         return None;
     }
     let done: Vec<bool> = bytes[8..].iter().map(|&b| b == 1).collect();
+    for (index, &is_done) in done.iter().enumerate() {
+        if is_done {
+            let end = ((index as u64 + 1) * chunk_bytes).min(total_size);
+            if end > part_len {
+                return None;
+            }
+        }
+    }
     Some(ExistingBitmap { chunk_bytes, done })
 }
 
@@ -122,7 +134,11 @@ pub async fn download(
     // the chunk size to whatever the interrupted attempt used so offsets and
     // bitmap flags line up; concurrency is always free to adapt.
     let (planned_chunk_bytes, max_concurrent) = pool.chunk_plan().await;
-    let existing = load_bitmap(&bitmap_path).await;
+    let part_len = tokio::fs::metadata(&part_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let existing = load_bitmap(&bitmap_path, part_len, total_size).await;
     let (chunk_bytes, prior_flags) = match existing {
         Some(bitmap) if bitmap.chunk_bytes > 0 => (bitmap.chunk_bytes, Some(bitmap.done)),
         _ => (planned_chunk_bytes, None),
@@ -175,7 +191,8 @@ pub async fn download(
             chunks_done: std::sync::atomic::AtomicU64::new(resumed_count as u64),
             bytes_done: std::sync::atomic::AtomicU64::new(0),
         },
-    );
+    )
+    .await;
     let download_progress = download_guard.handle();
 
     let mut tasks: tokio::task::JoinSet<anyhow::Result<(Chunk, bool)>> =
@@ -249,10 +266,10 @@ pub async fn download(
         });
     }
 
-    let mut ordered: Vec<Option<Bytes>> = vec![None; chunks_total];
+    let mut done: Vec<bool> = existing_bitmap;
     let mut next_offset: u64 = 0;
     let mut chunks_remaining = chunks_total;
-    let mut current_bitmap = existing_bitmap;
+    let mut current_bitmap: Vec<bool> = done.clone();
     let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
 
     while chunks_remaining > 0 {
@@ -271,54 +288,51 @@ pub async fn download(
             Err(error) => return Err(error.context("a chunk fetch exhausted retries")),
         };
 
+        // Mark the chunk present on disk. The bitmap is only updated here —
+        // after the fetch reported the exact byte count — never before.
         if !from_cache {
             current_bitmap[chunk.index] = true;
             save_bitmap(&bitmap_path, chunk_bytes, &current_bitmap).await;
         }
+        done[chunk.index] = true;
 
-        // Read back bytes from disk file for hashing and ordered client streaming
-        let bytes = {
-            let mut file = shared.lock().await;
-            file.seek(std::io::SeekFrom::Start(chunk.offset))
-                .await
-                .with_context(|| format!("seek {}", chunk.offset))?;
-            let mut buf = vec![0u8; chunk.length as usize];
-            file.read_exact(&mut buf)
-                .await
-                .with_context(|| format!("read {} bytes at {}", chunk.length, chunk.offset))?;
-            Bytes::from(buf)
-        };
-        ordered[chunk.index] = Some(bytes);
-
-        // Emit any contiguous prefix to the client; hash here too, because
-        // emission walks offsets in blob order while chunk tasks complete in
-        // whatever order the network delivers them.
+        // Emit any newly-contiguous prefix to the client, reading each chunk
+        // back from disk inside the emission loop. Completed-but-not-yet-
+        // emitted chunks are only a bool, so a stalled leading chunk cannot
+        // accumulate the whole blob's worth of memory in this collector.
         while next_offset < total_size {
             let next_index = (next_offset / chunk_bytes) as usize;
-            if next_index >= chunks_total {
+            if next_index >= chunks_total || !done[next_index] {
                 break;
             }
-            match ordered[next_index].take() {
-                Some(bytes) => {
-                    hasher.update(&bytes);
-                    next_offset += bytes.len() as u64;
-                    download_progress
-                        .chunks_done
-                        .fetch_add(1, Ordering::Relaxed);
-                    download_progress
-                        .bytes_done
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    let mut client_disconnected = false;
-                    if let Some(sender) = tx.as_ref() {
-                        if sender.send(Ok(bytes)).await.is_err() {
-                            client_disconnected = true;
-                        }
-                    }
-                    if client_disconnected {
-                        tx = None;
-                    }
+            let next_chunk = chunks[next_index];
+            let bytes = {
+                let mut file = shared.lock().await;
+                file.seek(std::io::SeekFrom::Start(next_chunk.offset))
+                    .await
+                    .with_context(|| format!("seek {}", next_chunk.offset))?;
+                let mut buf = vec![0u8; next_chunk.length as usize];
+                file.read_exact(&mut buf).await.with_context(|| {
+                    format!("read {} bytes at {}", next_chunk.length, next_chunk.offset)
+                })?;
+                Bytes::from(buf)
+            };
+            hasher.update(&bytes);
+            next_offset += bytes.len() as u64;
+            download_progress
+                .chunks_done
+                .fetch_add(1, Ordering::Relaxed);
+            download_progress
+                .bytes_done
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            let mut client_disconnected = false;
+            if let Some(sender) = tx.as_ref() {
+                if sender.send(Ok(bytes)).await.is_err() {
+                    client_disconnected = true;
                 }
-                None => break,
+            }
+            if client_disconnected {
+                tx = None;
             }
         }
         chunks_remaining -= 1;
@@ -468,6 +482,12 @@ async fn fetch_chunk(
             .await
             .with_context(|| format!("flush chunk {offset}"))?;
     }
+    // The bitmap may only claim what actually reached the disk: a 206 that
+    // ends early (no Content-Length) would otherwise mark a short chunk as
+    // done and poison the assembly.
+    if local_total != length {
+        bail!("chunk {offset} short read: got {local_total} of {length} bytes");
+    }
     total_received.fetch_add(local_total, Ordering::Relaxed);
     Ok(local_total)
 }
@@ -537,9 +557,24 @@ mod tests {
         let tmp = std::env::temp_dir().join("test_bitmap_persist.bitmap");
         let initial = vec![true, false, true, true];
         save_bitmap(&tmp, CHUNK_BYTES, &initial).await;
-        let loaded = load_bitmap(&tmp).await.expect("bitmap readable");
+        // Part file long enough to cover the done chunks (chunks 0, 2 and 3).
+        let part_len = CHUNK_BYTES * 4;
+        let loaded = load_bitmap(&tmp, part_len, CHUNK_BYTES * 4)
+            .await
+            .expect("bitmap readable");
         assert_eq!(loaded.chunk_bytes, CHUNK_BYTES);
         assert_eq!(loaded.done, initial);
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn bitmap_rejected_when_part_missing() {
+        let tmp = std::env::temp_dir().join("test_bitmap_orphan.bitmap");
+        let initial = vec![true, false];
+        save_bitmap(&tmp, CHUNK_BYTES, &initial).await;
+        // Part file gone/empty: every done flag is a lie, so the sidecar must
+        // be discarded instead of poisoning the retry loop forever.
+        assert!(load_bitmap(&tmp, 0, CHUNK_BYTES * 2).await.is_none());
         let _ = tokio::fs::remove_file(&tmp).await;
     }
 
@@ -547,14 +582,14 @@ mod tests {
     async fn bitmap_rejects_truncated_and_zero_header() {
         let tmp = std::env::temp_dir().join("test_bitmap_bad_header.bitmap");
         tokio::fs::write(&tmp, [0u8; 4]).await.unwrap();
-        assert!(load_bitmap(&tmp).await.is_none());
+        assert!(load_bitmap(&tmp, 0, 0).await.is_none());
         let zero_header = {
             let mut bytes = 0u64.to_le_bytes().to_vec();
             bytes.push(1);
             bytes
         };
         tokio::fs::write(&tmp, zero_header).await.unwrap();
-        assert!(load_bitmap(&tmp).await.is_none());
+        assert!(load_bitmap(&tmp, 0, 0).await.is_none());
         let _ = tokio::fs::remove_file(&tmp).await;
     }
 
