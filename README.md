@@ -15,7 +15,8 @@
 - **GitHub 加速**：9 个白名单域名透传（release/raw/codeload/api，git clone 支持）
 - **管理面板与 API**：`/dashboard` 交互面板；`/stats` 缓存指标；`/downloads` 进行中的分块下载；`GET /sources` 源权重与测速；`POST /sources/probe` 触发探测；`POST /cache/clear` 清空 blob 缓存
 - **镜像拉取工具（类 KSpeeder）**：面板输入镜像名 → 守护进程经本网关拉取（自动吃到多源竞速+缓存）→ 实时展示每层进度 → 完成后自动重命名回原始名称（`POST /pull` + `GET /pulls`）。需把 `/var/run/docker.sock` 挂入容器并 `group_add` docker 组 GID（见 compose.yaml 注释）；仅支持 docker.io / ghcr.io，私有仓库需先 `docker login`
-- **可选 TLS 监听**：设置 `TLS_CERT_PATH` + `TLS_KEY_PATH` 后 `LISTEN_ADDR` 变为 HTTPS 端口
+- **可选 TLS 监听**：设置 `TLS_CERT_PATH` + `TLS_KEY_PATH` 后 `LISTEN_ADDR` 变为 HTTPS 端口（若通过控制台签发了公链证书，自动优先使用公链证书）
+- **动态系统设置与一键证书（类 KSpeeder 体验）**：控制台“系统设置”区可热修改主域名、加速域名、加速端口、LAN IP 与 Cloudflare 凭据（持久化在数据卷 `settings.json`）；支持一键向 Cloudflare 创建 DNS A 记录，一键通过 acme.sh 容器完成 DNS-01 签发 Let's Encrypt 证书并自动热重启加载（公链根信任，客户端免装 CA）
 - **安全**：出站仅限白名单域名（上游 + 重定向 CDN），拒绝 IP 字面量/非 443/路径穿越
 
 ## 配置

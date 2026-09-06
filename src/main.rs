@@ -1,16 +1,18 @@
 mod cache;
 mod chunks;
 mod dockerpull;
+mod settings;
 mod sources;
 
 use std::{
     collections::HashSet,
     env,
     net::IpAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
+use tokio::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use axum::{
@@ -38,6 +40,7 @@ use reqwest::{redirect::Policy, Client};
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
 };
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
 use tower::limit::ConcurrencyLimitLayer;
@@ -120,6 +123,8 @@ struct AppState {
     /// Served at GET /ca.crt so LAN clients can import the self-signed CA
     /// without copying files; unset hides the endpoint.
     ca_path: Option<String>,
+    settings_path: PathBuf,
+    cert_job: Mutex<Option<Value>>,
     started: Instant,
 }
 
@@ -167,7 +172,10 @@ async fn main() -> Result<()> {
     let cache_dir = PathBuf::from(env_or("CACHE_DIR", "/data"));
     let cache_dir_display = cache_dir.display().to_string();
     let cache_max_gb = env_parse("CACHE_MAX_GB", 10_u64)?;
-    let cache = DiskCache::new(cache_dir, cache_max_gb.saturating_mul(1024 * 1024 * 1024));
+    let cache = DiskCache::new(
+        cache_dir.clone(),
+        cache_max_gb.saturating_mul(1024 * 1024 * 1024),
+    );
     cache
         .init()
         .await
@@ -227,12 +235,34 @@ async fn main() -> Result<()> {
     )?;
     let sources = sources::SourcePool::new(client.clone(), source_specs);
 
-    let tls_acceptor = load_tls_acceptor()?;
+    // Certificate precedence: settings-issued (Let's Encrypt via the settings
+    // UI) over env-provided over plain HTTP. Issued certs live on the data
+    // volume so they survive restarts.
+    let certs_live_dir = cache_dir.join("certs").join("live");
+    let live_fullchain = certs_live_dir.join("fullchain.pem");
+    let live_privkey = certs_live_dir.join("privkey.pem");
+    let (tls_acceptor, tls_source) = if live_fullchain.exists() && live_privkey.exists() {
+        match build_tls_acceptor(
+            live_fullchain.to_string_lossy().as_ref(),
+            live_privkey.to_string_lossy().as_ref(),
+        ) {
+            Ok(acceptor) => (Some(acceptor), "settings-issued"),
+            Err(error) => {
+                warn!(%error, "settings-issued certificate failed to load; falling back");
+                (load_tls_acceptor()?, "env")
+            }
+        }
+    } else {
+        (load_tls_acceptor()?, "env")
+    };
     let default_scheme: &'static str = if tls_acceptor.is_some() {
         "https"
     } else {
         "http"
     };
+    info!(source = tls_source, "TLS mode resolved");
+
+    let settings_path = settings::settings_path(&cache_dir);
 
     let state = Arc::new(AppState {
         client,
@@ -250,6 +280,8 @@ async fn main() -> Result<()> {
         pull_via_host: env::var("PULL_VIA_HOST").ok().filter(|v| !v.is_empty()),
         accel_addr: accel_addr.clone(),
         ca_path: env::var("CA_CERT_PATH").ok().filter(|v| !v.is_empty()),
+        settings_path,
+        cert_job: Mutex::new(None),
         started: Instant::now(),
     });
 
@@ -261,6 +293,10 @@ async fn main() -> Result<()> {
         .route("/pull", post(start_pull))
         .route("/pulls", get(list_pulls))
         .route("/ca.crt", get(serve_ca))
+        .route("/settings", get(get_settings).patch(save_settings))
+        .route("/settings/issue-cert", post(issue_cert))
+        .route("/settings/dns-records", post(create_dns_records))
+        .route("/settings/restart", post(restart_gateway))
         .route("/sources", get(sources_view))
         .route("/sources/probe", post(trigger_probe))
         .route("/cache/clear", post(clear_cache))
@@ -318,11 +354,14 @@ fn load_tls_acceptor() -> Result<Option<TlsAcceptor>> {
         }
         (Some(cert_path), Some(key_path)) => (cert_path, key_path),
     };
+    Ok(Some(build_tls_acceptor(&cert_path, &key_path)?))
+}
 
-    let cert_pem = std::fs::read_to_string(&cert_path)
+fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
+    let cert_pem = std::fs::read_to_string(cert_path)
         .with_context(|| format!("read TLS certificate {cert_path}"))?;
     let key_pem =
-        std::fs::read_to_string(&key_path).with_context(|| format!("read TLS key {key_path}"))?;
+        std::fs::read_to_string(key_path).with_context(|| format!("read TLS key {key_path}"))?;
     let certs: Vec<CertificateDer<'static>> = pem_der_blocks(&cert_pem, "CERTIFICATE")
         .into_iter()
         .map(CertificateDer::from)
@@ -340,7 +379,7 @@ fn load_tls_acceptor() -> Result<Option<TlsAcceptor>> {
     .with_no_client_auth()
     .with_single_cert(certs, key)
     .context("load TLS certificate/key pair")?;
-    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+    Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 fn private_key_from_pem(pem: &str, key_path: &str) -> Result<PrivateKeyDer<'static>> {
@@ -555,6 +594,303 @@ async fn dashboard_redirect() -> Response {
     Redirect::temporary("/dashboard").into_response()
 }
 
+/* ---------- settings ---------- */
+
+async fn get_settings(State(state): State<Arc<AppState>>) -> Response {
+    let settings = settings::Settings::load(&state.settings_path);
+    let cert_job = state.cert_job.lock().await.clone();
+    let extra = json!({
+        "pull_target": settings.pull_target().unwrap_or_default(),
+        "cert_job": cert_job.unwrap_or(json!({"status": "idle"})),
+    });
+    (
+        [(CONTENT_TYPE, "application/json")],
+        settings::settings_view(&settings, extra).to_string(),
+    )
+        .into_response()
+}
+
+async fn save_settings(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if request.method() != Method::PATCH {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let bytes = match request.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid body\n").into_response(),
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return (StatusCode::BAD_REQUEST, "expected json body\n").into_response();
+    };
+    let patch = settings::patch_from_body(&value);
+    let current = settings::Settings::load(&state.settings_path);
+    match current.apply(patch, &state.settings_path) {
+        Ok(updated) => {
+            let view = settings::settings_view(&updated, Value::Null);
+            ([(CONTENT_TYPE, "application/json")], view.to_string()).into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, format!("{error:#}\n")).into_response(),
+    }
+}
+
+/// Run acme.sh in a one-shot container to issue the public certificate for
+/// the configured domain family; on success the container restarts itself so
+/// the new certificate is loaded (cert paths take precedence over env TLS).
+async fn issue_cert(State(state): State<Arc<AppState>>) -> Response {
+    let settings = settings::Settings::load(&state.settings_path);
+    let (domain, token, zone, account) = match (
+        settings.domain.clone(),
+        settings.cf_token.clone(),
+        settings.cf_zone_id.clone(),
+        settings.cf_account_id.clone(),
+    ) {
+        (Some(d), Some(t), Some(z), Some(a)) if !t.is_empty() && !z.is_empty() && !a.is_empty() => {
+            (d, t, z, a)
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "需要先在设置里填好 主域名 / Cloudflare Token / Zone ID / Account ID\n",
+            )
+                .into_response()
+        }
+    };
+    let running = {
+        let mut job = state.cert_job.lock().await;
+        if job
+            .as_ref()
+            .is_some_and(|j| j.get("status").and_then(|s| s.as_str()) == Some("running"))
+        {
+            true
+        } else {
+            *job = Some(json!({"status": "running", "message": "准备中…"}));
+            false
+        }
+    };
+    if running {
+        return (
+            StatusCode::CONFLICT,
+            "certificate issuance already running\n",
+        )
+            .into_response();
+    }
+
+    let socket = env_or("DOCKER_SOCKET", "/var/run/docker.sock");
+    let self_id = dockerpull::self_container_id(&socket)
+        .await
+        .unwrap_or_default();
+    if self_id.is_empty() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "无法确定自身容器 ID\n").into_response();
+    }
+    let cache_dir = state
+        .settings_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let image_ref = format!(
+        "{}/neilpang/acme.sh:latest",
+        settings
+            .pull_target()
+            .unwrap_or_else(|| "127.0.0.1:4443".into())
+    );
+    let accel_domain = settings.accel_domain.clone();
+    let job_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let progress_fn = |message: String| {
+            if let Ok(mut inner) = job_state.cert_job.try_lock() {
+                if let Some(job) = inner.as_mut() {
+                    job["message"] = Value::String(message);
+                }
+            }
+        };
+        let progress: &(dyn Fn(String) + Send + Sync) = &progress_fn;
+        let result = dockerpull::issue_cert_job(
+            &socket,
+            &self_id,
+            &image_ref,
+            std::path::Path::new("/data"),
+            &domain,
+            accel_domain.as_deref(),
+            &token,
+            &zone,
+            &account,
+            progress,
+        )
+        .await;
+        let mut job = job_state.cert_job.lock().await;
+        match result {
+            Ok(()) => {
+                if let Some(job) = job.as_mut() {
+                    job["status"] = Value::String("done".into());
+                    job["restarting"] = Value::Bool(true);
+                }
+                drop(job);
+                // Bring the new certificate online: the process loads
+                // certs at startup, so restart the gateway container.
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                let socket = env_or("DOCKER_SOCKET", "/var/run/docker.sock");
+                if let Ok(self_id) = dockerpull::self_container_id(&socket).await {
+                    let _ = dockerpull::docker_api(
+                        &socket,
+                        hyper::Method::POST,
+                        &format!("/containers/{self_id}/restart?t=2"),
+                        None,
+                        60,
+                    )
+                    .await;
+                }
+            }
+            Err(error) => {
+                if let Some(job) = job.as_mut() {
+                    job["status"] = Value::String("failed".into());
+                    job["message"] = Value::String(format!("{error:#}"));
+                }
+            }
+        }
+    });
+    (StatusCode::ACCEPTED, "certificate issuance started\n").into_response()
+}
+
+async fn create_dns_records(State(state): State<Arc<AppState>>) -> Response {
+    let settings = settings::Settings::load(&state.settings_path);
+    let (Some(domain), Some(lan_ip), Some(token)) = (
+        settings.domain.as_deref(),
+        settings.lan_ip.as_deref(),
+        settings.cf_token.as_deref(),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "需要先在设置里填好 主域名 / LAN IP / Cloudflare Token\n",
+        )
+            .into_response();
+    };
+
+    let api = "https://api.cloudflare.com/client/v4";
+    let auth = [("Authorization", format!("Bearer {token}"))];
+    let zone_lookup = match state
+        .client
+        .get(format!("{api}/zones"))
+        .query(&[("name", domain)])
+        .headers(HeaderMap::from_iter(auth.iter().map(|(k, v)| {
+            (
+                HeaderName::from_static(k),
+                HeaderValue::from_str(v).unwrap(),
+            )
+        })))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(error) => {
+            return (StatusCode::BAD_GATEWAY, format!("zone lookup: {error}\n")).into_response()
+        }
+    };
+    let zones: Value = match zone_lookup.text().await {
+        Ok(text) => serde_json::from_str(&text).unwrap_or(Value::Null),
+        Err(error) => return (StatusCode::BAD_GATEWAY, format!("{error}\n")).into_response(),
+    };
+    let Some(zone_id) = zones
+        .pointer("/result/0/id")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("zone {domain} not found in this Cloudflare account\n"),
+        )
+            .into_response();
+    };
+
+    let names = [
+        domain.to_owned(),
+        format!("docker.{domain}"),
+        format!("git.{domain}"),
+        format!("*.{domain}"),
+    ];
+    let mut created = Vec::new();
+    let mut skipped = Vec::new();
+    for name in &names {
+        let existing = state
+            .client
+            .get(format!("{api}/zones/{zone_id}/dns_records"))
+            .query(&[("type", "A"), ("name", name.as_str())])
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await;
+        let existing_body = match existing {
+            Ok(r) => r.text().await.unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        let already = serde_json::from_str::<Value>(&existing_body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/result/0/id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            });
+        if already.is_some() {
+            skipped.push(name.clone());
+            continue;
+        }
+        let created_record = state
+            .client
+            .post(format!("{api}/zones/{zone_id}/dns_records"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(
+                json!({
+                    "type": "A",
+                    "name": name,
+                    "content": lan_ip,
+                    "ttl": 300,
+                    "proxied": false
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        match created_record {
+            Ok(r) if r.status().is_success() => created.push(name.clone()),
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("create {name} failed: HTTP {status} {body}\n"),
+                )
+                    .into_response();
+            }
+            Err(error) => return (StatusCode::BAD_GATEWAY, format!("{error}\n")).into_response(),
+        }
+    }
+    (
+        [(CONTENT_TYPE, "application/json")],
+        json!({"created": created, "skipped_existing": skipped}).to_string(),
+    )
+        .into_response()
+}
+
+async fn restart_gateway(State(state): State<Arc<AppState>>) -> Response {
+    let socket = env_or("DOCKER_SOCKET", "/var/run/docker.sock");
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        if let Ok(self_id) = dockerpull::self_container_id(&socket).await {
+            let _ = dockerpull::docker_api(
+                &socket,
+                hyper::Method::POST,
+                &format!("/containers/{self_id}/restart?t=2"),
+                None,
+                60,
+            )
+            .await;
+        }
+    });
+    (
+        [(CONTENT_TYPE, "application/json")],
+        "{\"restarting\": true}".to_string(),
+    )
+        .into_response()
+}
+
 async fn serve_ca(State(state): State<Arc<AppState>>) -> Response {
     let Some(path) = &state.ca_path else {
         return StatusCode::NOT_FOUND.into_response();
@@ -582,33 +918,36 @@ async fn start_pull(State(state): State<Arc<AppState>>, request: Request) -> Res
     if request.method() != Method::POST {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    // The daemon must reach us to pull. Prefer the explicit PULL_VIA_HOST;
-    // without it, accept the request Host header only when it names this
-    // machine (loopback or IP literal). An attacker-chosen domain would turn
-    // the daemon into a puller of arbitrary external registries, and the
-    // retag step would then present those images as locally-expected names.
-    let gateway_host = match &state.pull_via_host {
-        Some(host) => host.clone(),
-        None => {
-            let header = request
-                .headers()
-                .get(HOST)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("127.0.0.1");
-            let name = header
-                .rsplit_once(':')
-                .map(|(name, _)| name.trim_start_matches('[').trim_end_matches(']'))
-                .unwrap_or(header);
-            if name == "localhost" || name.parse::<IpAddr>().is_ok() {
-                header.to_owned()
-            } else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "refusing Host header that is not an IP literal; set PULL_VIA_HOST\n",
-                )
-                    .into_response();
+    // The daemon must reach us to pull. Settings (set in the dashboard) win,
+    // then PULL_VIA_HOST; a plain request Host is only accepted when it
+    // names this machine (loopback or IP literal) — an attacker-chosen
+    // domain would turn the daemon into a puller of external registries.
+    let settings = settings::Settings::load(&state.settings_path);
+    let gateway_host = match settings.pull_target() {
+        Some(target) => target,
+        None => match &state.pull_via_host {
+            Some(host) => host.clone(),
+            None => {
+                let header = request
+                    .headers()
+                    .get(HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("127.0.0.1");
+                let name = header
+                    .rsplit_once(':')
+                    .map(|(name, _)| name.trim_start_matches('[').trim_end_matches(']'))
+                    .unwrap_or(header);
+                if name == "localhost" || name.parse::<IpAddr>().is_ok() {
+                    header.to_owned()
+                } else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "refusing Host header that is not an IP literal; set PULL_VIA_HOST\n",
+                    )
+                        .into_response();
+                }
             }
-        }
+        },
     };
     let bytes = match request.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),

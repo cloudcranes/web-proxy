@@ -383,8 +383,69 @@
       </div>
     </section>
 
+    <section>
+      <div class="head" data-no="05"><h2>系统设置</h2><span class="aux">持久化到数据卷 · 随时热修改</span></div>
+      <div class="body">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:12px">
+          <div>
+            <div class="lbl" style="font-size:11px;color:var(--muted);margin-bottom:4px">主域名（面板 / realm）</div>
+            <input id="cfg-domain" type="text" placeholder="master.us.kg">
+          </div>
+          <div>
+            <div class="lbl" style="font-size:11px;color:var(--muted);margin-bottom:4px">加速域名（docker / git）</div>
+            <input id="cfg-accel-domain" type="text" placeholder="docker.master.us.kg">
+          </div>
+          <div>
+            <div class="lbl" style="font-size:11px;color:var(--muted);margin-bottom:4px">加速端口</div>
+            <input id="cfg-accel-port" type="text" placeholder="4443">
+          </div>
+          <div>
+            <div class="lbl" style="font-size:11px;color:var(--muted);margin-bottom:4px">局域网 IP（用于创建 DNS A 记录）</div>
+            <input id="cfg-lan-ip" type="text" placeholder="192.168.1.107">
+          </div>
+        </div>
+
+        <div style="border-top:1px dashed var(--line);padding-top:10px;margin-bottom:12px">
+          <div style="font-size:11px;letter-spacing:.12em;color:var(--muted);text-transform:uppercase;margin-bottom:6px">
+            Cloudflare 凭据（用于自动建 DNS 记录与一键签发公链证书）
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px">
+            <div>
+              <div class="lbl" style="font-size:11px;color:var(--muted);margin-bottom:4px">
+                API Token（DNS Edit 权限，留空保留已存）<span id="cfg-tok-status" class="muted"></span>
+              </div>
+              <input id="cfg-cf-token" type="password" placeholder="新建或修改时输入，展示时脱敏"
+                     style="font:13px var(--mono);color:var(--fg);background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:9px 12px;width:100%;">
+            </div>
+            <div>
+              <div class="lbl" style="font-size:11px;color:var(--muted);margin-bottom:4px">Zone ID</div>
+              <input id="cfg-cf-zone" type="text" placeholder="例如 dc77a61fd76877bf2fe3497c60d9010b">
+            </div>
+            <div>
+              <div class="lbl" style="font-size:11px;color:var(--muted);margin-bottom:4px">Account ID</div>
+              <input id="cfg-cf-account" type="text" placeholder="例如 d1f956a83548f660d3cacea5e1fa95a7">
+            </div>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button id="btn-save-cfg" class="primary" onclick="doSaveSettings()">保存设置</button>
+          <button id="btn-create-dns" onclick="doCreateDns()">一键在 CF 添加 A 记录</button>
+          <button id="btn-issue-cert" onclick="doIssueCert()">一键签发公链证书（DNS-01）</button>
+          <button id="btn-restart" onclick="doRestartGateway()">重启网关容器</button>
+          <span id="cfg-msg" style="font-size:12.5px"></span>
+        </div>
+        <div id="cfg-cert-box" style="display:none;margin-top:10px;padding:10px 12px;background:var(--inset);border:1px solid var(--line);border-radius:8px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="badge pulling" id="cert-badge">签发中</span>
+            <span id="cert-msg" style="font-size:12px;color:var(--fg)"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <footer>
-      API：<code>/pull</code> <code>/pulls</code> <code>/stats</code> <code>/downloads</code> <code>/sources</code> <code>POST /sources/probe</code> <code>POST /cache/clear</code> <code>/healthz</code>
+      API：<code>/pull</code> <code>/pulls</code> <code>/stats</code> <code>/downloads</code> <code>/settings</code> <code>/sources</code> <code>POST /sources/probe</code> <code>POST /cache/clear</code> <code>/healthz</code>
       · 自动刷新：统计 5s / 进度 2s
     </footer>
   </main>
@@ -647,7 +708,123 @@
     }).catch(() => {});
   }
 
-  loadStats(); loadPulls(); loadDownloads(); loadSources();
+  /* ---------- settings ---------- */
+  function sayCfg(text, isError) {
+    const el = document.getElementById('cfg-msg');
+    el.textContent = text;
+    el.className = isError ? 'err' : 'muted';
+    setTimeout(() => { el.textContent = ''; }, 6000);
+  }
+  function loadSettings() {
+    fetch('/settings').then(r => r.json()).then(s => {
+      if (s.domain) document.getElementById('cfg-domain').value = s.domain;
+      if (s.accel_domain) document.getElementById('cfg-accel-domain').value = s.accel_domain;
+      if (s.accel_port) document.getElementById('cfg-accel-port').value = s.accel_port;
+      if (s.lan_ip) document.getElementById('cfg-lan-ip').value = s.lan_ip;
+      if (s.cf_zone_id) document.getElementById('cfg-cf-zone').value = s.cf_zone_id;
+      if (s.cf_account_id) document.getElementById('cfg-cf-account').value = s.cf_account_id;
+      document.getElementById('cfg-tok-status').textContent = s.cf_token_set ? '（已设置）' : '（未设置）';
+      renderCertJob(s.cert_job);
+    }).catch(() => {});
+  }
+  async function doSaveSettings() {
+    const btn = document.getElementById('btn-save-cfg');
+    btn.disabled = true;
+    const body = {};
+    const v = id => document.getElementById(id).value.trim();
+    if (v('cfg-domain')) body.domain = v('cfg-domain');
+    if (v('cfg-accel-domain')) body.accel_domain = v('cfg-accel-domain');
+    if (v('cfg-accel-port')) body.accel_port = parseInt(v('cfg-accel-port'), 10) || 4443;
+    if (v('cfg-lan-ip')) body.lan_ip = v('cfg-lan-ip');
+    if (v('cfg-cf-token')) body.cf_token = v('cfg-cf-token');
+    if (v('cfg-cf-zone')) body.cf_zone_id = v('cfg-cf-zone');
+    if (v('cfg-cf-account')) body.cf_account_id = v('cfg-cf-account');
+    try {
+      const r = await fetch('/settings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (r.ok) {
+        sayCfg('设置已保存');
+        document.getElementById('cfg-cf-token').value = '';
+        loadSettings();
+      } else {
+        sayCfg('保存失败: ' + text.trim(), true);
+      }
+    } catch (e) { sayCfg('保存失败: ' + e, true); }
+    finally { btn.disabled = false; }
+  }
+  async function doCreateDns() {
+    const btn = document.getElementById('btn-create-dns');
+    btn.disabled = true;
+    try {
+      const r = await fetch('/settings/dns-records', { method: 'POST' });
+      const text = await r.text();
+      let j = {};
+      try { j = JSON.parse(text); } catch {}
+      if (r.ok) {
+        const c = (j.created || []).join(', ') || '无新建';
+        const s = (j.skipped_existing || []).join(', ');
+        sayCfg('DNS A 记录处理完成：新建 [' + c + ']' + (s ? '，跳过已有 [' + s + ']' : ''));
+      } else {
+        sayCfg('添加 DNS 失败: ' + (j.message || text.trim() || ('HTTP ' + r.status)), true);
+      }
+    } catch (e) { sayCfg('添加 DNS 失败: ' + e, true); }
+    finally { btn.disabled = false; }
+  }
+  async function doIssueCert() {
+    const btn = document.getElementById('btn-issue-cert');
+    btn.disabled = true;
+    try {
+      const r = await fetch('/settings/issue-cert', { method: 'POST' });
+      const text = await r.text();
+      if (r.ok || r.status === 202) {
+        sayCfg('已启动证书签发容器，请观察下方进度…');
+        pollCertJob();
+      } else {
+        sayCfg('启动签发失败: ' + text.trim(), true);
+      }
+    } catch (e) { sayCfg('启动签发失败: ' + e, true); }
+    finally { btn.disabled = false; }
+  }
+  function renderCertJob(job) {
+    const box = document.getElementById('cfg-cert-box');
+    const badge = document.getElementById('cert-badge');
+    const msg = document.getElementById('cert-msg');
+    if (!job || !job.status || job.status === 'idle') { box.style.display = 'none'; return; }
+    box.style.display = 'block';
+    badge.className = 'badge ' + (job.status === 'running' ? 'pulling' : job.status === 'done' ? 'done' : 'failed');
+    badge.textContent = job.status === 'running' ? '签发中' : job.status === 'done' ? '完成' : '失败';
+    msg.textContent = job.message || '';
+  }
+  let certTimer = null;
+  function pollCertJob() {
+    if (certTimer) clearInterval(certTimer);
+    certTimer = setInterval(() => {
+      fetch('/settings').then(r => r.json()).then(s => {
+        renderCertJob(s.cert_job);
+        if (s.cert_job && s.cert_job.status !== 'running') {
+          clearInterval(certTimer);
+          certTimer = null;
+          if (s.cert_job.status === 'done') {
+            sayCfg('证书已签发并热加载！');
+          }
+        }
+      }).catch(() => {});
+    }, 2000);
+  }
+  async function doRestartGateway() {
+    if (!confirm('确认重启网关容器？服务将中断约 3 秒。')) return;
+    try {
+      await fetch('/settings/restart', { method: 'POST' });
+      sayCfg('正在重启… 3 秒后刷新');
+      setTimeout(() => location.reload(), 3500);
+    } catch (e) { sayCfg('重启失败: ' + e, true); }
+  }
+
+  loadStats(); loadPulls(); loadDownloads(); loadSources(); loadSettings();
   setInterval(loadStats, 5000);
   setInterval(loadPulls, 2000);
   setInterval(loadDownloads, 2000);

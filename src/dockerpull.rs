@@ -744,3 +744,340 @@ mod tests {
         assert!(err.to_string().contains("not found"));
     }
 }
+
+/// ---------- generic Docker Engine API helpers (unix socket) ----------
+
+/// One JSON (or empty) request against the Docker Engine API. Returns the
+/// parsed body; non-2xx raises with the daemon's message.
+#[cfg(unix)]
+pub(crate) async fn docker_api(
+    socket: &str,
+    method: Method,
+    path_and_query: &str,
+    body: Option<serde_json::Value>,
+    timeout_secs: u64,
+) -> Result<serde_json::Value> {
+    use http_body_util::{BodyExt, Empty, Full};
+
+    let stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connect docker socket {socket}"))?;
+    let (mut sender, conn) = http1::handshake(TokioIo::new(stream))
+        .await
+        .context("docker api handshake")?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut builder = HyperRequest::builder()
+        .method(method)
+        .uri(path_and_query)
+        .header("host", "docker");
+    let request = match body {
+        Some(value) => builder
+            .header("content-type", "application/json")
+            .body(Full::new(axum::body::Bytes::from(value.to_string())))
+            .context("build docker api request")?,
+        None => builder
+            .body(Empty::<axum::body::Bytes>::new())
+            .context("build docker api request")?,
+    };
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        sender.send_request(request),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("docker api timed out after {timeout_secs}s"))?
+    .context("docker api request")?;
+    let status = response.status();
+    let bytes = BodyExt::collect(response.into_body())
+        .await
+        .context("read docker api response")?
+        .to_bytes();
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if !status.is_success() {
+        let message = value
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("no message");
+        bail!("docker api HTTP {status}: {message}");
+    }
+    Ok(value)
+}
+
+/// The gateway's own container id: the container hostname is a short id.
+#[cfg(unix)]
+pub(crate) async fn self_container_id(socket: &str) -> Result<String> {
+    let id = tokio::fs::read_to_string("/etc/hostname")
+        .await
+        .context("read /etc/hostname")?
+        .trim()
+        .to_owned();
+    if id.is_empty() {
+        bail!("empty /etc/hostname");
+    }
+    Ok(id)
+}
+
+/// Issue (or renew) the public certificate for the configured domain by
+/// running a one-shot acme.sh container doing DNS-01 against the stored
+/// Cloudflare token. Certificates land under {cache_dir}/certs/{domain}_ecc/
+/// and are copied to {cache_dir}/certs/live/ for the gateway to load.
+#[cfg(unix)]
+pub(crate) async fn issue_cert_job(
+    socket: &str,
+    self_id: &str,
+    image_ref: &str,
+    cache_dir: &std::path::Path,
+    domain: &str,
+    accel_domain: Option<&str>,
+    cf_token: &str,
+    cf_zone_id: &str,
+    cf_account_id: &str,
+    progress: &(dyn Fn(String) + Send + Sync),
+) -> Result<()> {
+    use http_body_util::BodyExt;
+
+    progress(format!("拉取 acme.sh 镜像（{image_ref}）…"));
+    docker_api(
+        socket,
+        Method::POST,
+        &format!(
+            "/images/create?fromImage={}&tag=latest",
+            percent_encode_path(image_ref)
+        ),
+        None,
+        900,
+    )
+    .await?;
+
+    progress("定位数据卷…");
+    let info = docker_api(
+        socket,
+        Method::GET,
+        &format!("/containers/{self_id}/json"),
+        None,
+        30,
+    )
+    .await?;
+    let mount = info
+        .get("Mounts")
+        .and_then(|m| m.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|m| m.get("Destination").and_then(|d| d.as_str()) == Some("/data"))
+                .cloned()
+        })
+        .context("gateway /data volume not found")?;
+    let volume_source = mount
+        .get("Source")
+        .and_then(|s| s.as_str())
+        .context("/data mount has no source")?
+        .to_owned();
+
+    // Remove a leftover issuer container from a previous run.
+    let _ = docker_api(
+        socket,
+        Method::DELETE,
+        "/containers/web-proxy-acme?force=true&v=true",
+        None,
+        30,
+    )
+    .await;
+
+    // SAN set: apex, wildcard, acceleration host, git host — deduped.
+    let mut names = vec![domain.to_owned(), format!("*.{domain}")];
+    if let Some(extra) = accel_domain {
+        if !extra.ends_with(domain) && !names.contains(&extra.to_owned()) {
+            names.push(extra.to_owned());
+        }
+    }
+    let git_host = format!("git.{domain}");
+    if !names.contains(&git_host) {
+        names.push(git_host);
+    }
+
+    let mut cmd = vec![
+        "--issue".to_owned(),
+        "--dns".to_owned(),
+        "dns_cf".to_owned(),
+        "--server".to_owned(),
+        "letsencrypt".to_owned(),
+        "--keylength".to_owned(),
+        "ec-256".to_owned(),
+        "--cert-home".to_owned(),
+        "/certs".to_owned(),
+    ];
+    for name in &names {
+        cmd.push("-d".to_owned());
+        cmd.push(name.clone());
+    }
+
+    progress("创建 acme.sh 容器（DNS-01 验证）…");
+    let created = docker_api(
+        socket,
+        Method::POST,
+        "/containers/create?name=web-proxy-acme",
+        Some(json!({
+            "Image": "neilpang/acme.sh:latest",
+            "Cmd": cmd,
+            "Env": [
+                format!("CF_Token={cf_token}"),
+                format!("CF_Account_ID={cf_account_id}"),
+                format!("CF_Zone_ID={cf_zone_id}"),
+            ],
+            "HostConfig": {
+                "Mounts": [{"Type": "volume", "Source": volume_source, "Target": "/certs"}],
+                "Dns": ["223.5.5.5", "119.29.29.29"],
+                "AutoRemove": false,
+            }
+        })),
+        60,
+    )
+    .await?;
+    let id = created
+        .get("Id")
+        .and_then(|v| v.as_str())
+        .context("container create returned no Id")?
+        .to_owned();
+
+    progress("等待 DNS-01 验证与签发（约 1-2 分钟）…");
+    docker_api(
+        socket,
+        Method::POST,
+        &format!("/containers/{id}/start"),
+        None,
+        60,
+    )
+    .await?;
+    let wait = tokio::time::timeout(
+        std::time::Duration::from_secs(900),
+        docker_api(
+            socket,
+            Method::POST,
+            &format!("/containers/{id}/wait"),
+            None,
+            960,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("签发超时（15 分钟）"))?
+    .context("docker wait")?;
+    let exit_code = wait
+        .get("StatusCode")
+        .and_then(|c| c.as_i64())
+        .unwrap_or(-1);
+    if exit_code != 0 {
+        let logs = container_log_tail(socket, &id, 40)
+            .await
+            .unwrap_or_default();
+        let _ = docker_api(
+            socket,
+            Method::DELETE,
+            &format!("/containers/{id}?force=true"),
+            None,
+            30,
+        )
+        .await;
+        bail!("acme.sh 退出码 {exit_code}: {logs}");
+    }
+    let _ = docker_api(
+        socket,
+        Method::DELETE,
+        &format!("/containers/{id}"),
+        None,
+        30,
+    )
+    .await;
+
+    progress("部署证书…");
+    let cert_dir = cache_dir.join("certs").join(format!("{domain}_ecc"));
+    let live_dir = cache_dir.join("certs").join("live");
+    tokio::fs::create_dir_all(&live_dir).await?;
+    tokio::fs::copy(
+        cert_dir.join("fullchain.cer"),
+        live_dir.join("fullchain.pem"),
+    )
+    .await
+    .context("copy fullchain")?;
+    tokio::fs::copy(
+        cert_dir.join(format!("{domain}.key")),
+        live_dir.join("privkey.pem"),
+    )
+    .await
+    .context("copy privkey")?;
+    progress(format!("证书已签发（{}）", names.join(", ")));
+    Ok(())
+}
+
+/// Pull the last `tail` lines out of docker's multiplexed log stream.
+#[cfg(unix)]
+async fn container_log_tail(socket: &str, id: &str, tail: u32) -> Result<String> {
+    use http_body_util::BodyExt;
+
+    let stream = tokio::net::UnixStream::connect(socket).await?;
+    let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let request = HyperRequest::builder()
+        .method(Method::GET)
+        .uri(&format!(
+            "/containers/{id}/logs?stdout=1&stderr=1&tail={tail}"
+        ))
+        .header("host", "docker")
+        .body(http_body_util::Empty::<axum::body::Bytes>::new())?;
+    let response = sender.send_request(request).await?;
+    let bytes = BodyExt::collect(response.into_body()).await?.to_bytes();
+    // Demux frames: [stream(1), pad(3), len(4 BE), payload...]
+    let mut out: Vec<u8> = Vec::new();
+    let mut rest: &[u8] = &bytes;
+    while rest.len() >= 8 {
+        let len = u32::from_be_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
+        if rest.len() < 8 + len {
+            break;
+        }
+        out.extend_from_slice(&rest[8..8 + len]);
+        rest = &rest[8 + len..];
+    }
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .map(|l| {
+            l.trim_start_matches(|c: char| !c.is_ascii_graphic() && !c.is_alphanumeric())
+                .to_owned()
+                + "\n"
+        })
+        .collect())
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn docker_api(
+    _socket: &str,
+    _method: Method,
+    _path_and_query: &str,
+    _body: Option<serde_json::Value>,
+    _timeout_secs: u64,
+) -> Result<serde_json::Value> {
+    bail!("docker socket is only available on unix hosts");
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn self_container_id(_socket: &str) -> Result<String> {
+    bail!("docker socket is only available on unix hosts");
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn issue_cert_job(
+    _socket: &str,
+    _self_id: &str,
+    _image_ref: &str,
+    _cache_dir: &std::path::Path,
+    _domain: &str,
+    _accel_domain: Option<&str>,
+    _cf_token: &str,
+    _cf_zone_id: &str,
+    _cf_account_id: &str,
+    _progress: &(dyn Fn(String) + Send + Sync),
+) -> Result<()> {
+    bail!("certificate issuance is only available on unix hosts");
+}
