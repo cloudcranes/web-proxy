@@ -758,6 +758,9 @@ pub(crate) async fn docker_api(
     timeout_secs: u64,
 ) -> Result<serde_json::Value> {
     use http_body_util::{BodyExt, Empty, Full};
+    use hyper::client::conn::http1;
+    use hyper_util::rt::TokioIo;
+    use serde_json::Value;
 
     let stream = tokio::net::UnixStream::connect(socket)
         .await
@@ -773,13 +776,17 @@ pub(crate) async fn docker_api(
         .method(method)
         .uri(path_and_query)
         .header("host", "docker");
+    // Two body types branch here, so build the request once per arm into a
+    // single concrete type instead of trying to unify them.
     let request = match body {
         Some(value) => builder
             .header("content-type", "application/json")
-            .body(Full::new(axum::body::Bytes::from(value.to_string())))
+            .body(http_body_util::Full::new(axum::body::Bytes::from(
+                value.to_string(),
+            )))
             .context("build docker api request")?,
         None => builder
-            .body(Empty::<axum::body::Bytes>::new())
+            .body(http_body_util::Empty::<axum::body::Bytes>::new())
             .context("build docker api request")?,
     };
     let response = tokio::time::timeout(
@@ -851,7 +858,7 @@ pub(crate) async fn issue_cert_job(
     )
     .await?;
 
-    progress("定位数据卷…");
+    progress("定位数据卷…".into());
     let info = docker_api(
         socket,
         Method::GET,
@@ -913,7 +920,7 @@ pub(crate) async fn issue_cert_job(
         cmd.push(name.clone());
     }
 
-    progress("创建 acme.sh 容器（DNS-01 验证）…");
+    progress("创建 acme.sh 容器（DNS-01 验证）…".into());
     let created = docker_api(
         socket,
         Method::POST,
@@ -941,7 +948,7 @@ pub(crate) async fn issue_cert_job(
         .context("container create returned no Id")?
         .to_owned();
 
-    progress("等待 DNS-01 验证与签发（约 1-2 分钟）…");
+    progress("等待 DNS-01 验证与签发（约 1-2 分钟）…".into());
     docker_api(
         socket,
         Method::POST,
@@ -990,7 +997,7 @@ pub(crate) async fn issue_cert_job(
     )
     .await;
 
-    progress("部署证书…");
+    progress("部署证书…".into());
     let cert_dir = cache_dir.join("certs").join(format!("{domain}_ecc"));
     let live_dir = cache_dir.join("certs").join("live");
     tokio::fs::create_dir_all(&live_dir).await?;
@@ -1014,6 +1021,8 @@ pub(crate) async fn issue_cert_job(
 #[cfg(unix)]
 async fn container_log_tail(socket: &str, id: &str, tail: u32) -> Result<String> {
     use http_body_util::BodyExt;
+    use hyper::client::conn::http1;
+    use hyper_util::rt::TokioIo;
 
     let stream = tokio::net::UnixStream::connect(socket).await?;
     let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await?;
