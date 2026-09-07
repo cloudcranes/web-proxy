@@ -25,7 +25,7 @@
 |---|---|---|---|
 | `LISTEN_ADDR` | 否 | `0.0.0.0:20516` | 监听地址（日常访问：面板/管理） |
 | `ACCEL_LISTEN_ADDR` | 否 | 不启用 | 加速端口（docker 拉取 / GitHub 代理），与主端口同协议；两端口服务同一套路由 |
-| `LISTEN_ADDR_HTTP` | 否 | 不启用 | **纯 HTTP** 的 dashboard 端口(仅服务 `/`、`/dashboard`、只读 `/stats`、`/pulls`、`/downloads`、`/sources`、`/healthz`、`/metrics/history`，其他路径 404);HTTPS 端口的 `/` 检测到它会自动 308 跳转到这里。设了 `DOMAIN` 或 `LISTEN_ADDR_HTTP_HOST` 后跳转地址带可读域名 |
+| `LISTEN_ADDR_HTTP` | 否 | 不启用 | 已废弃 —— 同端口协议嗅探让 HTTP dashboard 与 HTTPS 全 API 直接共享一个监听器,无需单独端口 |
 | `CACHE_DIR` | 否 | `/data` | blob 缓存目录（compose 已挂数据卷） |
 | `CACHE_MAX_GB` | 否 | `10` | blob 缓存容量上限 |
 | `MANIFEST_TTL_SECS` | 否 | `60` | manifest 内存缓存 TTL |
