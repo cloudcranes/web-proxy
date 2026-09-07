@@ -1,1 +1,11 @@
-/target
+# Build artifacts
+/target/
+
+# Local tooling and dependencies
+/node_modules/
+/package.json
+/package-lock.json
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
