@@ -563,7 +563,10 @@ async fn serve_multi(
             };
             match acceptor.as_ref() {
                 Some(acceptor) if first == 0x16 => {
-                    let tls = match acceptor.accept(stream).await {
+                    // Prepend the consumed byte so rustls sees a complete
+                    // ClientHello (we read 1 byte to sniff, must put it back).
+                    let restored = Rewind::new(first, stream);
+                    let tls = match acceptor.accept(restored).await {
                         Ok(tls) => tls,
                         Err(error) => {
                             warn!(%error, "TLS handshake failed");
