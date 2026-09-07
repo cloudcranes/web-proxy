@@ -96,6 +96,32 @@ impl SourcePool {
         &self.specs
     }
 
+    /// Snapshot the current per-source stats (lightweight: clones the
+    /// `Vec<SourceStats>`, doesn't allocate per source). Used by the
+    /// metrics history sampler and by the dashboard /sources endpoint.
+    pub async fn snapshot_iter(&self) -> Vec<SourceStats> {
+        self.stats.read().await.clone()
+    }
+
+    /// Test helper: build a pool with one fake source without a real client.
+    pub fn for_test() -> Arc<Self> {
+        use crate::sources::SourceSpec;
+        let spec = SourceSpec {
+            name: "test".into(),
+            registry_url: "https://example.test".into(),
+            token_url: "https://example.test/token".into(),
+            token_service: "test".into(),
+        };
+        Arc::new(Self {
+            client: reqwest::Client::new(),
+            specs: vec![spec],
+            stats: RwLock::new(vec![SourceStats::default()]),
+            weights: RwLock::new(vec![1.0]),
+            seq: AtomicU64::new(0),
+            token_cache: Mutex::new(HashMap::new()),
+        })
+    }
+
     pub fn name(&self, index: usize) -> &str {
         self.specs[index].name.as_str()
     }

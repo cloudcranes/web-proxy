@@ -1,6 +1,7 @@
 mod cache;
 mod chunks;
 mod dockerpull;
+mod metrics;
 mod settings;
 mod sources;
 
@@ -125,6 +126,7 @@ struct AppState {
     ca_path: Option<String>,
     settings_path: PathBuf,
     cert_job: Mutex<Option<Value>>,
+    metrics_history: Arc<metrics::History>,
     started: Instant,
 }
 
@@ -282,6 +284,7 @@ async fn main() -> Result<()> {
         ca_path: env::var("CA_CERT_PATH").ok().filter(|v| !v.is_empty()),
         settings_path,
         cert_job: Mutex::new(None),
+        metrics_history: Arc::new(metrics::History::new()),
         started: Instant::now(),
     });
 
@@ -289,6 +292,7 @@ async fn main() -> Result<()> {
         .route("/", get(dashboard_redirect))
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
+        .route("/metrics/history", get(metrics_history))
         .route("/downloads", get(downloads))
         .route("/pull", post(start_pull))
         .route("/pulls", get(list_pulls))
@@ -305,7 +309,7 @@ async fn main() -> Result<()> {
         .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
         .layer(ConcurrencyLimitLayer::new(max_concurrent_requests))
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(Arc::clone(&state));
 
     // Daily access (dashboard/management) and acceleration (docker pulls,
     // git proxy) can live on separate ports; both serve the same router.
@@ -335,6 +339,21 @@ async fn main() -> Result<()> {
             }
         }
     } else {
+        // Lift the Arcs the metrics sampler needs out of `state` before it is
+        // moved into `serve_multi`/the router build below.
+        let metrics_history = Arc::clone(&state.metrics_history);
+        let metrics_stats = Arc::clone(&state.stats);
+        let metrics_sources = Arc::clone(&state.sources);
+        let metrics_cache = Arc::clone(&state.cache);
+        let metrics_disk_cap = state.cache.max_bytes();
+        let disk_bytes_fn = Arc::new(move || metrics_cache.bytes_on_disk());
+        metrics::spawn(
+            metrics_history,
+            metrics_stats,
+            metrics_sources,
+            disk_bytes_fn,
+            metrics_disk_cap,
+        );
         serve_multi(Arc::new(listeners), tls_acceptor, app, drain_timeout).await?;
     }
     Ok(())
@@ -557,6 +576,20 @@ async fn healthz(method: Method) -> Response {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     "ok\n".into_response()
+}
+
+async fn metrics_history(State(state): State<Arc<AppState>>) -> Response {
+    let stats = Arc::clone(&state.stats);
+    let snap = metrics::snapshot_now(
+        &stats,
+        &state.sources,
+        state.cache.bytes_on_disk(),
+        state.cache.max_bytes(),
+    );
+    match metrics::history_json(&state.metrics_history, snap).await {
+        Ok(value) => ([(CONTENT_TYPE, "application/json")], value.to_string()).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}\n")).into_response(),
+    }
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Response {

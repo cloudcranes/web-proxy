@@ -184,6 +184,18 @@
   .segbar i { flex: 1; background: var(--panel2); border-radius: 2px; }
   .segbar i.on { background: linear-gradient(180deg, var(--s0), #17a895); box-shadow: 0 0 6px rgba(45,212,191,.35); }
 
+  /* sparklines */
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 15px; }
+  .chart { border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(180deg, var(--panel-hi), var(--panel) 60%); box-shadow: var(--shadow); padding: 12px 14px; }
+  .chart .head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+  .chart .lbl { font-size: 10.5px; letter-spacing: .13em; color: var(--muted); text-transform: uppercase; }
+  .chart .val { font: 650 18px var(--mono); font-variant-numeric: tabular-nums; }
+  .chart .sub { color: var(--dim); font-size: 11.5px; margin-top: 2px; }
+  .spark { width: 100%; height: 52px; display: block; }
+  .spark path.line { fill: none; stroke: var(--s0); stroke-width: 1.6; stroke-linejoin: round; }
+  .spark path.fill { fill: url(#sparkGrad); opacity: .25; }
+  .spark .axis { stroke: var(--line); stroke-width: 1; stroke-dasharray: 2 4; }
+
   /* sources lanes */
   .lane { padding: 11px 2px; border-bottom: 1px dashed var(--line); }
   .lane:last-child { border-bottom: none; }
@@ -298,6 +310,48 @@
 
     <!-- OVERVIEW -->
     <section class="page active" id="page-overview">
+      <div class="charts">
+        <div class="chart">
+          <div class="head"><span class="lbl">命中率</span><span class="val mono" id="c-hit-val">–</span></div>
+          <svg class="spark" viewBox="0 0 200 50" preserveAspectRatio="none">
+            <defs><linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--s0)" stop-opacity=".5"/><stop offset="100%" stop-color="var(--s0)" stop-opacity="0"/></linearGradient></defs>
+            <line class="axis" x1="0" y1="25" x2="200" y2="25"/>
+            <path class="fill" id="c-hit-fill" d=""/>
+            <path class="line" id="c-hit-line" d=""/>
+          </svg>
+          <div class="sub" id="c-hit-sub">最近 2 小时 · 每 30 秒采样</div>
+        </div>
+        <div class="chart">
+          <div class="head"><span class="lbl">磁盘占用</span><span class="val mono" id="c-disk-val">–</span></div>
+          <svg class="spark" viewBox="0 0 200 50" preserveAspectRatio="none">
+            <defs><linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--s0)" stop-opacity=".5"/><stop offset="100%" stop-color="var(--s0)" stop-opacity="0"/></linearGradient></defs>
+            <line class="axis" x1="0" y1="50" x2="200" y2="50"/>
+            <path class="fill" id="c-disk-fill" d=""/>
+            <path class="line" id="c-disk-line" d=""/>
+          </svg>
+          <div class="sub" id="c-disk-sub">缓存目录使用率</div>
+        </div>
+        <div class="chart">
+          <div class="head"><span class="lbl">活跃下载</span><span class="val mono" id="c-active-val">–</span></div>
+          <svg class="spark" viewBox="0 0 200 50" preserveAspectRatio="none">
+            <defs><linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--s0)" stop-opacity=".5"/><stop offset="100%" stop-color="var(--s0)" stop-opacity="0"/></linearGradient></defs>
+            <line class="axis" x1="0" y1="50" x2="200" y2="50"/>
+            <path class="fill" id="c-active-fill" d=""/>
+            <path class="line" id="c-active-line" d=""/>
+          </svg>
+          <div class="sub" id="c-active-sub">并行分块下载任务数</div>
+        </div>
+        <div class="chart">
+          <div class="head"><span class="lbl">合计吞吐</span><span class="val mono" id="c-tput-val">–</span></div>
+          <svg class="spark" viewBox="0 0 200 50" preserveAspectRatio="none">
+            <defs><linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--s0)" stop-opacity=".5"/><stop offset="100%" stop-color="var(--s0)" stop-opacity="0"/></linearGradient></defs>
+            <line class="axis" x1="0" y1="50" x2="200" y2="50"/>
+            <path class="fill" id="c-tput-fill" d=""/>
+            <path class="line" id="c-tput-line" d=""/>
+          </svg>
+          <div class="sub" id="c-tput-sub">全部在线上游源合计</div>
+        </div>
+      </div>
       <div class="gauges">
         <div class="gauge with-ring">
           <div class="ring" id="g-ratio-ring" style="--pct:0"><span id="g-ratio">–</span></div>
@@ -486,15 +540,11 @@
   }
   function refreshForView() {
     const r = PAGES[view].refresh;
-    if (r.stats) loadStats(true);
+    if (r.stats) { loadStats(true); loadCharts(); }
     if (r.pulls) loadPulls();
     if (r.downloads) loadDownloads();
     if (r.sources) { loadSources('lanes'); loadSources('lanes-full'); }
-    // Topbar chip refresh is cheap, always done.
-    if (r.stats !== undefined && !r.stats) {
-      // tools page: refresh less often
-      loadStats(true);
-    }
+    if (r.stats !== undefined && !r.stats) loadStats(true);
   }
   document.querySelectorAll('#nav a').forEach(a => {
     a.addEventListener('click', (e) => { e.preventDefault(); view = a.dataset.view; applyView(); });
@@ -817,6 +867,68 @@
   }
 
   /* ---------- stats (sidebar + topbar) ---------- */
+  function fmtCount(n) {
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+    return String(Math.round(n));
+  }
+  // One SVG line/fill pair: x=0..199 across W=200, y=0..49 across H=50.
+  // NaN/missing series collapses to a flat zero line so the layout stays stable
+  // while the first sample is still being collected.
+  function drawSpark(id, values, opts) {
+    const line = document.getElementById(id + '-line');
+    const fill = document.getElementById(id + '-fill');
+    if (!line || !fill) return;
+    const W = 200, H = 50;
+    const min = opts.min, max = opts.max;
+    const N = values.length;
+    if (N === 0) {
+      line.setAttribute('d', '');
+      fill.setAttribute('d', '');
+      return;
+    }
+    const xStep = N > 1 ? W / (N - 1) : 0;
+    const yOf = v => {
+      if (!isFinite(v)) return H;
+      const r = (v - min) / Math.max(max - min, 1e-9);
+      return H - 1 - Math.max(0, Math.min(1, r)) * (H - 4);
+    };
+    let lineD = '', fillD = '';
+    for (let i = 0; i < N; i++) {
+      const x = i * xStep;
+      const y = yOf(values[i]);
+      lineD += (i === 0 ? 'M' : 'L') + x.toFixed(2) + ' ' + y.toFixed(2) + ' ';
+      fillD += (i === 0 ? 'M' : 'L') + x.toFixed(2) + ' ' + y.toFixed(2) + ' ';
+    }
+    // Close the fill to baseline (H-1).
+    fillD += (W - 1 + (N - 1) * 0).toFixed(2) + ' ' + H + ' ';
+    fillD += '0 ' + H + ' Z';
+    line.setAttribute('d', lineD.trim());
+    fill.setAttribute('d', fillD.trim());
+  }
+  function loadCharts() {
+    fetch('/metrics/history').then(r => r.json()).then(j => {
+      const history = j.history || [];
+      // Always render against the longest window so older samples line up
+      // visually with the right edge; older than ~30 samples get clipped.
+      const hits = history.map(s => s.hit);
+      const disks = history.map(s => s.disk);
+      const actives = history.map(s => s.active);
+      const tputs = history.map(s => s.throughput);
+      drawSpark('c-hit', hits, { min: 0, max: 100 });
+      drawSpark('c-disk', disks, { min: 0, max: 100 });
+      drawSpark('c-active', actives, { min: 0, max: Math.max(1, ...actives) * 1.2 });
+      drawSpark('c-tput', tputs, { min: 0, max: Math.max(1, ...tputs) * 1.2 });
+      const hitNow = j.current && isFinite(j.current.hit) ? j.current.hit : (hits.length ? hits[hits.length - 1] : 0);
+      const diskNow = j.current && isFinite(j.current.disk) ? j.current.disk : (disks.length ? disks[disks.length - 1] : 0);
+      const activeNow = j.current && isFinite(j.current.active) ? j.current.active : (actives.length ? actives[actives.length - 1] : 0);
+      const tputNow = j.current && isFinite(j.current.throughput) ? j.current.throughput : (tputs.length ? tputs[tputs.length - 1] : 0);
+      document.getElementById('c-hit-val').textContent = (hitNow || 0).toFixed(1) + '%';
+      document.getElementById('c-disk-val').textContent = (diskNow || 0).toFixed(1) + '%';
+      document.getElementById('c-active-val').textContent = fmtCount(activeNow || 0);
+      document.getElementById('c-tput-val').textContent = tputNow > 0 ? fmtBytes(tputNow) + '/s' : '–';
+    }).catch(() => {});
+  }
+
   function loadStats(silent) {
     fetch('/stats').then(r => r.json()).then(s => {
       const total = s.blob_cache_hits + s.blob_cache_misses;
