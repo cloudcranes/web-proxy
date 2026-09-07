@@ -354,7 +354,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    if listeners.len() == 1 && tls_acceptor.is_none() && http_listener.is_none() {
+    if listeners.len() == 1 && tls_acceptor.is_none() {
         info!(%listen_addr, "listening (HTTP)");
         let server =
             axum::serve(listeners.remove(0), app).with_graceful_shutdown(shutdown_signal());
@@ -383,31 +383,14 @@ async fn main() -> Result<()> {
             disk_bytes_fn,
             metrics_disk_cap,
         );
-        // The HTTPS listener stack carries the full router. The optional
-        // plain-HTTP listener carries ONLY the dashboard read surface (page
-        // + read-only stats/downloads/sources/pulls/history endpoints) — never
-        // /pull, /pulls (POST), /cache/clear, /sources/probe, or anything
-        // that mutates cache or runs the local docker daemon.
-        let http_socket = match http_listener {
-            Some(l) => l,
-            None => {
-                serve_multi(Arc::new(listeners), tls_acceptor, app, drain_timeout).await?;
-                return Ok(());
-            }
-        };
-        let http_main = tokio::spawn(async move {
-            let server =
-                axum::serve(http_socket, dashboard_app).with_graceful_shutdown(shutdown_signal());
-            tokio::select! {
-                result = server => result.context("serve HTTP dashboard")?,
-                _ = drain_deadline(drain_timeout) => {
-                    warn!(drain_timeout_secs = drain_timeout, "drain timeout exceeded; closing remaining connections");
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        });
-        serve_multi(Arc::new(listeners), tls_acceptor, app, drain_timeout).await?;
-        let _ = http_main.await;
+        serve_multi(
+            Arc::new(listeners),
+            tls_acceptor,
+            app,
+            dashboard_app,
+            drain_timeout,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -503,19 +486,27 @@ fn pem_der_blocks(pem: &str, label: &str) -> Vec<Vec<u8>> {
     ders
 }
 
-/// Serve one or more listeners with the same router, wrapping connections in
-/// TLS when an acceptor is configured. Used whenever an acceleration port is
-/// configured or TLS is on; the plain single-port HTTP path keeps axum::serve.
+/// Serve one or more listeners. When TLS is configured, each connection is
+/// dispatched by sniffing the first byte: `0x16` (TLS ClientHello) gets
+/// the full router, anything else gets the dashboard-only router — so the
+/// same port can host both HTTPS (full API) and HTTP (panel) without a
+/// separate bind. When TLS is off, all connections go to the full router
+/// over plain HTTP.
 async fn serve_multi(
     listeners: Arc<Vec<tokio::net::TcpListener>>,
     acceptor: Option<TlsAcceptor>,
-    app: Router,
+    full_app: Router,
+    dashboard_app: Router,
     drain_timeout: u64,
 ) -> Result<()> {
     // FuturesUnordered drops a future once it yields, so every accept must
     // re-arm its listener before the next loop turn or the accept loop dies
     // after exactly one connection per port.
-    let scheme = if acceptor.is_some() { "https" } else { "http" };
+    let scheme = if acceptor.is_some() {
+        "https+http"
+    } else {
+        "http"
+    };
     for listener in listeners.iter() {
         match listener.local_addr() {
             Ok(addr) => info!(listen = %addr, %scheme, "listening"),
@@ -553,11 +544,25 @@ async fn serve_multi(
                 continue;
             }
         };
-        let app = app.clone();
+        let full_app = full_app.clone();
+        let dashboard_app = dashboard_app.clone();
         let acceptor = acceptor.clone();
         conns.spawn(async move {
-            match acceptor {
-                Some(acceptor) => {
+            // TLS protocol sniffing: read the first byte of each connection
+            // to decide TLS (0x16 ClientHello) vs plain HTTP. We rewind the
+            // byte back into the stream before handing it to axum or the
+            // TLS acceptor so they see a complete stream.
+            let mut sniff_buf = [0u8; 1];
+            let first = match stream.peek(&mut sniff_buf).await {
+                Ok(0) => return,
+                Ok(_) => sniff_buf[0],
+                Err(error) => {
+                    warn!(%error, "sniff failed");
+                    return;
+                }
+            };
+            match acceptor.as_ref() {
+                Some(acceptor) if first == 0x16 => {
                     let tls = match acceptor.accept(stream).await {
                         Ok(tls) => tls,
                         Err(error) => {
@@ -565,9 +570,19 @@ async fn serve_multi(
                             return;
                         }
                     };
-                    serve_conn(TokioIo::new(tls), app, drain_timeout).await;
+                    serve_conn(TokioIo::new(tls), full_app, drain_timeout).await;
                 }
-                None => serve_conn(TokioIo::new(stream), app, drain_timeout).await,
+                _ => {
+                    let app = if acceptor.is_some() {
+                        // HTTPS port + plain HTTP -> dashboard-only surface
+                        // (no /pull, no settings writes, no daemon actions).
+                        dashboard_app.clone()
+                    } else {
+                        // No TLS at all: full router over plain HTTP.
+                        full_app.clone()
+                    };
+                    serve_conn(TokioIo::new(Rewind::new(first, stream)), app, drain_timeout).await;
+                }
             }
         });
     }
@@ -588,6 +603,63 @@ async fn serve_multi(
         }
     }
     Ok(())
+}
+
+/// Prepend a buffered byte to an async stream so the protocol sniffer
+/// can read the first byte to decide TLS vs HTTP and still hand the
+/// complete stream to axum. The first call to `poll_read` returns the
+/// buffered byte(s); subsequent calls fall through to the inner stream.
+struct Rewind<I> {
+    buffered: std::collections::VecDeque<u8>,
+    inner: I,
+}
+
+impl<I: tokio::io::AsyncRead + Unpin + Send> Rewind<I> {
+    fn new(first: u8, inner: I) -> Self {
+        let mut buffered = std::collections::VecDeque::new();
+        buffered.push_back(first);
+        Self { buffered, inner }
+    }
+}
+
+impl<I: tokio::io::AsyncRead + Unpin + Send> tokio::io::AsyncRead for Rewind<I> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(b) = self.buffered.pop_front() {
+            buf.put_slice(&[b]);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        let me = &mut *self;
+        std::pin::Pin::new(&mut me.inner).poll_read(cx, buf)
+    }
+}
+
+impl<I: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for Rewind<I> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let me = &mut *self;
+        std::pin::Pin::new(&mut me.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = &mut *self;
+        std::pin::Pin::new(&mut me.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = &mut *self;
+        std::pin::Pin::new(&mut me.inner).poll_shutdown(cx)
+    }
 }
 
 async fn serve_conn<I>(io: TokioIo<I>, app: Router, drain_timeout: u64)
