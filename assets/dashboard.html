@@ -232,15 +232,86 @@
   footer { color: var(--dim); font-size: 11.5px; padding: 10px 2px; }
   footer code { color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
 
+  /* tablet: shrink topbar/lanes */
   @media (max-width: 880px) {
     .shell { flex-direction: column; }
-    .side { position: static; width: auto; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px 18px; border-right: none; border-bottom: 1px solid var(--line); }
+    .side { position: static; width: auto; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px 18px; border-right: none; border-bottom: 1px solid var(--line); padding: 14px 16px; }
     .side .grow, .side .divider { display: none; }
     .nav { flex-direction: row; flex-wrap: wrap; }
     .side-actions { flex-direction: row; }
     .side-actions button { width: auto; }
     main { padding: 14px; }
+    .topbar h1 { font-size: 17px; }
+    .gauge .val { font-size: 22px; }
   }
+
+  /* phone: single column, condensed everything, scrollable tables */
+  @media (max-width: 540px) {
+    .shell { background-attachment: scroll; }
+    .side { padding: 12px; gap: 8px 12px; }
+    .brand b { font-size: 14px; }
+    .brand span { font-size: 9px; }
+    .brand .mark { width: 28px; height: 28px; font-size: 13px; }
+    .side .live { font-size: 11px; padding: 6px 8px; }
+    .side-stat { font-size: 11px; }
+    .nav { width: 100%; flex-direction: row; flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; margin: 0 -4px; }
+    .nav a { flex: 0 0 auto; padding: 6px 10px; font-size: 12px; }
+    .nav a span:not(.ico):not(.badge) { display: none; }
+    .nav a .ico { margin: 0; }
+    .nav a.active { background: rgba(45,212,191,.18); }
+    .nav a .badge { font-size: 10px; }
+    .side-actions { width: 100%; }
+    .side-actions button { flex: 1; font-size: 12px; padding: 6px 8px; }
+    main { padding: 10px; }
+    .topbar { gap: 8px; margin-bottom: 12px; }
+    .topbar .crumbs h1 { font-size: 16px; }
+    .topbar .crumb { font-size: 11px; }
+    .topbar .chips { width: 100%; gap: 5px; }
+    .topbar .chip { padding: 3px 8px; font-size: 11px; }
+    section > .head { padding: 10px 12px; }
+    section > .head h2 { font-size: 10px; letter-spacing: .12em; }
+    section > .head .aux { font-size: 10.5px; }
+    section > .body { padding: 12px; }
+    .gauges { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .gauge { padding: 10px 12px; }
+    .gauge .lbl { font-size: 9.5px; letter-spacing: .1em; }
+    .gauge .val { font-size: 19px; margin-top: 2px; }
+    .gauge .sub { font-size: 10.5px; }
+    .gauge.with-ring { padding: 10px 12px; }
+    .ring { width: 48px; height: 48px; }
+    .ring::before { width: 36px; height: 36px; }
+    .charts { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .chart { padding: 10px 12px; }
+    .chart .val { font-size: 16px; }
+    .spark { height: 42px; }
+    .row-input { gap: 6px; }
+    .row-input input { min-width: 0; font-size: 14px; }
+    .row-input button { padding: 8px 12px; }
+    .grid-2 { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .grid-2 .form-row:nth-child(n+3) { grid-column: span 2; }
+    .grid-2 .form-row label { font-size: 10px; }
+    .grid-2 .form-row input { padding: 7px 9px; font-size: 12px; }
+    .btnbar { gap: 6px; }
+    .btnbar button { padding: 7px 12px; font-size: 12px; }
+    .pulljob { padding: 9px 10px; }
+    .pulljob .name { font-size: 12px; }
+    .lrow .lst { width: 120px; font-size: 11px; }
+    .lane { padding: 9px 2px; }
+    .lane .stats { font-size: 11px; gap: 8px; }
+    .segbar { height: 10px; min-width: 100px; }
+    table { font-size: 12px; }
+    th, td { padding: 6px 8px; }
+    th { font-size: 9.5px; }
+    .empty { padding: 16px 6px; }
+    footer { font-size: 10.5px; padding: 8px 2px; }
+    footer code { font-size: 10px; }
+  }
+
+  /* very narrow: keep charts full-width */
+  @media (max-width: 380px) {
+    .gauges, .charts { grid-template-columns: 1fr; }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     * { animation: none !important; transition: none !important; }
   }
