@@ -288,6 +288,22 @@ async fn main() -> Result<()> {
         started: Instant::now(),
     });
 
+    // Plain HTTP listener: dashboard page + read-only stats/sources/pulls/
+    // downloads/history/healthz. No pull, no settings writes, no cache clear,
+    // no docker.sock actions, no git proxy — anything mutating or
+    // auth-sensitive stays on HTTPS only.
+    let dashboard_app = Router::new()
+        .route("/", get(dashboard_redirect))
+        .route("/dashboard", get(dashboard))
+        .route("/healthz", get(healthz))
+        .route("/stats", get(stats))
+        .route("/metrics/history", get(metrics_history))
+        .route("/downloads", get(downloads))
+        .route("/pulls", get(list_pulls))
+        .route("/sources", get(sources_view))
+        .fallback(not_found_on_http)
+        .with_state(Arc::clone(&state));
+
     let app = Router::new()
         .route("/", get(dashboard_redirect))
         .route("/healthz", get(healthz))
@@ -324,8 +340,21 @@ async fn main() -> Result<()> {
         listeners.push(listener);
         info!(%accel, "listening (acceleration port)");
     }
+    // Optional plain-HTTP port for the dashboard only. Set
+    // LISTEN_ADDR_HTTP=0.0.0.0:8080 to expose /dashboard without TLS.
+    // Unauthenticated acceleration endpoints stay HTTPS-only.
+    let http_dashboard_addr = env::var("LISTEN_ADDR_HTTP").ok().filter(|v| !v.is_empty());
+    let http_listener = if let Some(addr) = &http_dashboard_addr {
+        let l = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("bind http dashboard {addr}"))?;
+        info!(%addr, "listening (HTTP dashboard only)");
+        Some(l)
+    } else {
+        None
+    };
 
-    if listeners.len() == 1 && tls_acceptor.is_none() {
+    if listeners.len() == 1 && tls_acceptor.is_none() && http_listener.is_none() {
         info!(%listen_addr, "listening (HTTP)");
         let server =
             axum::serve(listeners.remove(0), app).with_graceful_shutdown(shutdown_signal());
@@ -354,7 +383,31 @@ async fn main() -> Result<()> {
             disk_bytes_fn,
             metrics_disk_cap,
         );
+        // The HTTPS listener stack carries the full router. The optional
+        // plain-HTTP listener carries ONLY the dashboard read surface (page
+        // + read-only stats/downloads/sources/pulls/history endpoints) — never
+        // /pull, /pulls (POST), /cache/clear, /sources/probe, or anything
+        // that mutates cache or runs the local docker daemon.
+        let http_socket = match http_listener {
+            Some(l) => l,
+            None => {
+                serve_multi(Arc::new(listeners), tls_acceptor, app, drain_timeout).await?;
+                return Ok(());
+            }
+        };
+        let http_main = tokio::spawn(async move {
+            let server =
+                axum::serve(http_socket, dashboard_app).with_graceful_shutdown(shutdown_signal());
+            tokio::select! {
+                result = server => result.context("serve HTTP dashboard")?,
+                _ = drain_deadline(drain_timeout) => {
+                    warn!(drain_timeout_secs = drain_timeout, "drain timeout exceeded; closing remaining connections");
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        });
         serve_multi(Arc::new(listeners), tls_acceptor, app, drain_timeout).await?;
+        let _ = http_main.await;
     }
     Ok(())
 }
@@ -624,7 +677,24 @@ async fn downloads(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn dashboard_redirect() -> Response {
+    // When the plain-HTTP dashboard port is configured, prefer it so the
+    // browser does not have to deal with a TLS warning for the panel.
+    let http_host = env::var("LISTEN_ADDR_HTTP").ok().filter(|v| !v.is_empty());
+    if let Some(addr) = http_host {
+        if let Some((host, _port)) = addr.rsplit_once(':') {
+            return Redirect::permanent(&format!("http://{}:20516/dashboard", host))
+                .into_response();
+        }
+    }
     Redirect::temporary("/dashboard").into_response()
+}
+
+async fn not_found_on_http() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "this endpoint is not served over plain HTTP; use the HTTPS port (20516)\n",
+    )
+        .into_response()
 }
 
 /* ---------- settings ---------- */
