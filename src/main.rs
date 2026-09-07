@@ -679,11 +679,23 @@ async fn downloads(State(state): State<Arc<AppState>>) -> Response {
 async fn dashboard_redirect() -> Response {
     // When the plain-HTTP dashboard port is configured, prefer it so the
     // browser does not have to deal with a TLS warning for the panel.
-    let http_host = env::var("LISTEN_ADDR_HTTP").ok().filter(|v| !v.is_empty());
-    if let Some(addr) = http_host {
-        if let Some((host, _port)) = addr.rsplit_once(':') {
-            return Redirect::permanent(&format!("http://{}:20516/dashboard", host))
-                .into_response();
+    // LISTEN_ADDR_HTTP_HOST overrides the host portion of the URL; defaults
+    // to the gateway's primary domain (or the loopback fallback).
+    if let Some(addr) = env::var("LISTEN_ADDR_HTTP").ok().filter(|v| !v.is_empty()) {
+        if let Some((_, port)) = addr.rsplit_once(':') {
+            if let Ok(port) = port.parse::<u16>() {
+                let host = env::var("LISTEN_ADDR_HTTP_HOST")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| {
+                        env::var("DOMAIN")
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or_else(|| "127.0.0.1".to_owned())
+                    });
+                return Redirect::permanent(&format!("http://{}:{}/dashboard", host, port))
+                    .into_response();
+            }
         }
     }
     Redirect::temporary("/dashboard").into_response()
