@@ -537,7 +537,7 @@ async fn serve_multi(
         let listeners = Arc::clone(&listeners);
         accepts.push(Box::pin(async move { (i, listeners[i].accept().await) }));
 
-        let (stream, _peer) = match accepted {
+        let (mut stream, _peer) = match accepted {
             Ok(pair) => pair,
             Err(error) => {
                 warn!(%error, "accept failed");
@@ -549,12 +549,12 @@ async fn serve_multi(
         let acceptor = acceptor.clone();
         conns.spawn(async move {
             // TLS protocol sniffing: read the first byte of each connection
-            // to decide TLS (0x16 ClientHello) vs plain HTTP. We rewind the
-            // byte back into the stream before handing it to axum or the
-            // TLS acceptor so they see a complete stream.
+            // (consumes it from the stream) to decide TLS (0x16 ClientHello)
+            // vs plain HTTP, then prepend that same byte back via Rewind so
+            // axum/rustls see the complete stream.
             let mut sniff_buf = [0u8; 1];
-            let first = match stream.peek(&mut sniff_buf).await {
-                Ok(0) => return,
+            let first = match stream.read(&mut sniff_buf).await {
+                Ok(0) => return, // client closed before sending anything
                 Ok(_) => sniff_buf[0],
                 Err(error) => {
                     warn!(%error, "sniff failed");
