@@ -365,8 +365,8 @@
       <div class="side-stat" id="s-accelrow" style="display:none"><span>加速端口</span><b class="mono" id="s-accel">–</b></div>
     </div>
     <div class="side-actions">
-      <button id="btn-probe" onclick="doProbe()">重新测速</button>
-      <button id="btn-clear" onclick="doClear()">清空缓存</button>
+      <button id="btn-probe" data-action="doProbe">重新测速</button>
+      <button id="btn-clear" data-action="doClear">清空缓存</button>
     </div>
     <div class="ver" id="s-ver">–</div>
   </aside>
@@ -439,7 +439,7 @@
         <div class="gauge"><div class="lbl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg>活跃下载</div><div class="val" id="g-active">–</div><div class="sub" id="g-plan">–</div></div>
       </div>
       <section style="margin-bottom:0">
-        <div class="head" data-no="01"><h2>上游源竞速</h2><span class="aux">权重高则分到更多块</span><button style="padding:5px 12px;font-size:12px" onclick="gotoSourceEditor()">编辑加速源</button></div>
+        <div class="head" data-no="01"><h2>上游源竞速</h2><span class="aux">权重高则分到更多块</span><button style="padding:5px 12px;font-size:12px" data-action="gotoSourceEditor">编辑加速源</button></div>
         <div class="body" id="lanes"></div>
       </section>
     </section>
@@ -449,8 +449,8 @@
       <div class="head" data-no="02"><h2>镜像拉取</h2><span class="aux">经网关加速 · 完成后自动重命名</span></div>
       <div class="body">
         <div class="row-input">
-          <input id="pull-input" type="text" placeholder="redis:alpine · bitnami/wordpress · ghcr.io/owner/img:tag" onkeydown="if (event.key === 'Enter') doPull()">
-          <button id="btn-pull" class="primary" onclick="doPull()">拉取</button>
+          <input id="pull-input" type="text" placeholder="redis:alpine · bitnami/wordpress · ghcr.io/owner/img:tag" data-enter-action="doPull">
+          <button id="btn-pull" class="primary" data-action="doPull">拉取</button>
         </div>
         <div style="height:12px"></div>
         <div id="pulls"></div>
@@ -473,15 +473,15 @@
       <div class="body">
         <div id="lanes-full" style="margin-bottom:14px"></div>
         <div class="btnbar">
-          <button onclick="doProbe()">重新测速</button>
-          <button onclick="toggleSourceEditor()">编辑加速源</button>
+          <button data-action="doProbe">重新测速</button>
+          <button data-action="toggleSourceEditor">编辑加速源</button>
           <span class="muted" id="probe-status"></span>
         </div>
         <div id="source-editor" style="display:none;margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
           <div id="source-rows"></div>
           <div class="btnbar" style="margin-top:12px">
-            <button onclick="addSourceRow()">添加源</button>
-            <button id="btn-save-sources" class="primary" onclick="doSaveSources()">保存并热加载</button>
+            <button data-action="addSourceRow">添加源</button>
+            <button id="btn-save-sources" class="primary" data-action="doSaveSources">保存并热加载</button>
             <span id="source-msg" class="muted"></span>
           </div>
           <div class="muted" style="font-size:11px;margin-top:8px">至少保留一个源；地址必须使用 HTTPS 443。</div>
@@ -494,19 +494,19 @@
       <div class="head" data-no="05"><h2>GitHub 加速</h2><span class="aux">白名单域名透传</span></div>
       <div class="body">
         <div class="row-input">
-          <input id="gh-input" type="text" placeholder="粘贴 GitHub 链接：repo / raw / releases / gist" onkeydown="if (event.key === 'Enter') convertGh()">
-          <button id="btn-gh" onclick="convertGh()">生成加速链接</button>
+          <input id="gh-input" type="text" placeholder="粘贴 GitHub 链接：repo / raw / releases / gist" data-enter-action="convertGh">
+          <button id="btn-gh" data-action="convertGh">生成加速链接</button>
         </div>
         <div id="gh-out" style="display:none">
           <div style="display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap">
             <span class="badge pulling">加速地址</span>
             <code id="gh-url" style="flex:1"></code>
-            <button style="padding:5px 12px" onclick="copyEl('gh-url')">复制</button>
+            <button style="padding:5px 12px" data-action="copyEl" data-id="gh-url">复制</button>
           </div>
           <div id="gh-gitrow" style="display:none;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap">
             <span class="badge done">git clone</span>
             <code id="gh-git" style="flex:1"></code>
-            <button style="padding:5px 12px" onclick="copyEl('gh-git')">复制</button>
+            <button style="padding:5px 12px" data-action="copyEl" data-id="gh-git">复制</button>
           </div>
           <div id="gh-err" class="err" style="display:none"></div>
         </div>
@@ -534,10 +534,10 @@
           </div>
         </div>
         <div class="btnbar">
-          <button id="btn-save-cfg" class="primary" onclick="doSaveSettings()">保存设置</button>
-          <button id="btn-create-dns" onclick="doCreateDns()">一键在 CF 添加 A 记录</button>
-          <button id="btn-issue-cert" onclick="doIssueCert()">一键签发公链证书（DNS-01）</button>
-          <button id="btn-restart" onclick="doRestartGateway()">重启网关容器</button>
+          <button id="btn-save-cfg" class="primary" data-action="doSaveSettings">保存设置</button>
+          <button id="btn-create-dns" data-action="doCreateDns">一键在 CF 添加 A 记录</button>
+          <button id="btn-issue-cert" data-action="doIssueCert">一键签发公链证书（DNS-01）</button>
+          <button id="btn-restart" data-action="doRestartGateway">重启网关容器</button>
           <span id="cfg-msg"></span>
         </div>
         <div id="cfg-cert-box" style="display:none;margin-top:10px;padding:10px 12px;background:var(--inset);border:1px solid var(--line);border-radius:8px">
@@ -552,22 +552,22 @@
           </div>
           <div class="row-input" style="margin-bottom:8px">
             <input id="cfg-snippet-image" type="text" placeholder="例：nginx:alpine · ghcr.io/owner/img:tag">
-            <button onclick="buildClientSnippet()">生成</button>
+            <button data-action="buildClientSnippet">生成</button>
           </div>
           <div style="display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap">
             <span class="badge pulling">docker pull</span>
             <code id="client-snippet-pull" style="flex:1"></code>
-            <button style="padding:5px 12px" onclick="copyEl('client-snippet-pull')">复制</button>
+            <button style="padding:5px 12px" data-action="copyEl" data-id="client-snippet-pull">复制</button>
           </div>
           <div style="display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap">
             <span class="badge done">daemon.json</span>
             <code id="client-snippet-daemon" style="flex:1"></code>
-            <button style="padding:5px 12px" onclick="copyEl('client-snippet-daemon')">复制</button>
+            <button style="padding:5px 12px" data-action="copyEl" data-id="client-snippet-daemon">复制</button>
           </div>
           <div style="display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap">
             <span class="badge new">PULL_VIA_HOST</span>
             <code id="client-snippet-env" style="flex:1"></code>
-            <button style="padding:5px 12px" onclick="copyEl('client-snippet-env')">复制</button>
+            <button style="padding:5px 12px" data-action="copyEl" data-id="client-snippet-env">复制</button>
           </div>
           <div id="client-snippet-err" class="err" style="display:none"></div>
           <div class="muted" style="font-size:11px;margin-top:8px">
@@ -586,6 +586,28 @@
 
 <script>
   const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  /* ---------- event delegation ----------
+   * All buttons/inputs use `data-action="name"` and `data-id="..."` /
+   * `data-enter-action="name"` instead of inline onclick/onkeydown so a
+   * future strict CSP (no `unsafe-inline`) keeps them working. */
+  function dispatchAction(action, target) {
+    if (!action) return;
+    if (action === 'copyEl') return copyEl(target.dataset.id || '');
+    if (action === 'removeSourceRow') return removeSourceRow(target);
+    const fn = window[action];
+    if (typeof fn === 'function') return fn(target);
+    console.warn('unknown action:', action);
+  }
+  document.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-action]');
+    if (t) dispatchAction(t.dataset.action, t);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    const t = e.target.closest('[data-enter-action]');
+    if (t) { e.preventDefault(); dispatchAction(t.dataset.enterAction, t); }
+  });
 
   /* ---------- connection health ----------
    * Track consecutive fetch failures so a silent /stats returning 500 (e.g.
@@ -947,7 +969,7 @@
       sourceField('Registry URL', 'registry', source.registry, 'https://registry-1.docker.io') +
       sourceField('Token URL（可空）', 'token', source.token, 'https://auth.docker.io/token') +
       sourceField('Service（可空）', 'service', source.service, 'registry.docker.io') +
-      '<button type="button" onclick="removeSourceRow(this)">删除</button>';
+      '<button type="button" data-action="removeSourceRow">删除</button>';
     document.getElementById('source-rows').appendChild(row);
   }
   function removeSourceRow(button) {
