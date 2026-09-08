@@ -9,12 +9,13 @@
 //!   score = max(0, success_rate) / (1 + p50_ms / 1000)
 //! `score == 0` disables the source; higher = preferred.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
@@ -22,7 +23,7 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_PATH: &str = "/v2/"; // small and supported by every registry
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceSpec {
     pub name: String,
     pub registry_url: String,
@@ -86,6 +87,9 @@ impl SourcePool {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(PROBE_INTERVAL).await;
+                if Arc::strong_count(&prober) == 1 {
+                    break;
+                }
                 Self::probe_all_arc(Arc::clone(&prober)).await;
             }
         });
@@ -94,6 +98,10 @@ impl SourcePool {
 
     pub fn specs(&self) -> &[SourceSpec] {
         &self.specs
+    }
+
+    pub fn specs_json(&self) -> serde_json::Value {
+        specs_json(&self.specs)
     }
 
     /// Snapshot the current per-source stats (lightweight: clones the
@@ -328,8 +336,9 @@ impl SourcePool {
         token
     }
 
-    pub async fn trigger_probe(self: &Arc<Self>) {
-        Self::probe_all_arc(Arc::clone(self)).await;
+    pub fn trigger_probe(self: &Arc<Self>) {
+        let pool = Arc::clone(self);
+        tokio::spawn(async move { Self::probe_all_arc(pool).await });
     }
 
     async fn recompute_weights(&self) {
@@ -469,43 +478,57 @@ pub fn load_or_default(
     Ok(fallback)
 }
 
-fn parse(text: &str) -> Result<Vec<SourceSpec>> {
+pub fn parse(text: &str) -> Result<Vec<SourceSpec>> {
     let parsed: serde_json::Value =
         serde_json::from_str(text).map_err(|e| anyhow!("sources.json: {e}"))?;
+    parse_value(&parsed)
+}
+
+pub fn parse_value(parsed: &serde_json::Value) -> Result<Vec<SourceSpec>> {
     let array = parsed
         .get("sources")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("sources.json missing 'sources' array"))?;
     let mut out = Vec::with_capacity(array.len());
+    let mut names = HashSet::with_capacity(array.len());
     for item in array {
         let name = item
             .get("name")
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
             .ok_or_else(|| anyhow!("source missing 'name'"))?
             .to_owned();
+        if name.len() > 64 || name.chars().any(char::is_control) {
+            bail!("invalid source name: {name}");
+        }
+        if !names.insert(name.clone()) {
+            bail!("duplicate source name: {name}");
+        }
         let registry = item
             .get("registry")
             .and_then(|v| v.as_str())
+            .map(str::trim)
             .ok_or_else(|| anyhow!("source missing 'registry'"))?;
         let token = item
             .get("token")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
+            .trim()
             .to_owned();
         let service = item
             .get("service")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
+            .trim()
             .to_owned();
         validate_https(registry)?;
-        // Empty token marks an anonymous mirror that serves blobs without
-        // auth; only auth-style sources need a reachable https token URL.
         if !token.is_empty() {
             validate_https(&token)?;
         }
         out.push(SourceSpec {
             name,
-            registry_url: registry.to_owned(),
+            registry_url: registry.trim_end_matches('/').to_owned(),
             token_url: token,
             token_service: service,
         });
@@ -513,13 +536,52 @@ fn parse(text: &str) -> Result<Vec<SourceSpec>> {
     if out.is_empty() {
         bail!("sources.json has no entries");
     }
+    if out.len() > 32 {
+        bail!("sources.json supports at most 32 entries");
+    }
     Ok(out)
+}
+
+pub fn specs_json(specs: &[SourceSpec]) -> serde_json::Value {
+    serde_json::json!({
+        "sources": specs.iter().map(|spec| serde_json::json!({
+            "name": spec.name,
+            "registry": spec.registry_url,
+            "token": spec.token_url,
+            "service": spec.token_service,
+        })).collect::<Vec<_>>()
+    })
+}
+
+pub fn save(path: &Path, specs: &[SourceSpec]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, specs_json(specs).to_string())
+        .with_context(|| format!("write {}", tmp.display()))?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error).with_context(|| format!("replace {}", path.display()));
+    }
+    Ok(())
+}
+
+pub fn sources_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("sources.json")
 }
 
 fn validate_https(url: &str) -> Result<()> {
     let u = Url::parse(url)?;
-    if u.scheme() != "https" {
-        bail!("source url must be https: {url}");
+    if u.scheme() != "https" || u.host_str().is_none() || u.port_or_known_default() != Some(443) {
+        bail!("source url must use https port 443: {url}");
+    }
+    if !u.username().is_empty()
+        || u.password().is_some()
+        || u.query().is_some()
+        || u.fragment().is_some()
+    {
+        bail!("source url cannot contain credentials, query, or fragment: {url}");
     }
     Ok(())
 }
@@ -616,6 +678,34 @@ mod tests {
             ]
         }"#;
         assert!(parse(text).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_names() {
+        let text = r#"{
+            "sources": [
+                {"name": "same", "registry": "https://one.example"},
+                {"name": "same", "registry": "https://two.example"}
+            ]
+        }"#;
+        assert!(parse(text).is_err());
+    }
+
+    #[test]
+    fn saved_sources_round_trip() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "web-proxy-sources-{}-{nonce}.json",
+            std::process::id()
+        ));
+        let expected = vec![spec("saved")];
+        save(&path, &expected).unwrap();
+        let actual = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use anyhow::{bail, Context, Result};
 use axum::{
@@ -21,9 +21,9 @@ use axum::{
     extract::{OriginalUri, Request, State},
     http::{
         header::{
-            ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST,
-            IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LOCATION, RANGE, SET_COOKIE,
-            TRANSFER_ENCODING, USER_AGENT, WWW_AUTHENTICATE,
+            ACCEPT, ACCEPT_RANGES, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE,
+            CONTENT_TYPE, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LOCATION, RANGE,
+            SET_COOKIE, TRANSFER_ENCODING, USER_AGENT, WWW_AUTHENTICATE,
         },
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
     },
@@ -42,7 +42,7 @@ use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
 };
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio_rustls::TlsAcceptor;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::ServiceExt;
@@ -104,7 +104,7 @@ impl Registry {
 
 struct AppState {
     client: Client,
-    sources: Arc<sources::SourcePool>,
+    sources: Arc<RwLock<Arc<sources::SourcePool>>>,
     dockerhub: RegistryConfig,
     ghcr: RegistryConfig,
     allowed_registry_hosts: HashSet<String>,
@@ -125,6 +125,7 @@ struct AppState {
     /// without copying files; unset hides the endpoint.
     ca_path: Option<String>,
     settings_path: PathBuf,
+    sources_path: PathBuf,
     cert_job: Mutex<Option<Value>>,
     metrics_history: Arc<metrics::History>,
     started: Instant,
@@ -195,6 +196,12 @@ async fn main() -> Result<()> {
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(connect_timeout))
         .read_timeout(Duration::from_secs(1800))
+        // Adaptive H2 window tuning handles initial-stream/connection
+        // sizing internally; the two `initial_*` setters would be ignored
+        // while this is true.
+        .http2_adaptive_window(true)
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(Duration::from_secs(90))
         .redirect(Policy::none())
         .build()
         .context("build HTTP client")?;
@@ -222,8 +229,14 @@ async fn main() -> Result<()> {
         allowed_registry_hosts.insert(host.to_ascii_lowercase());
     }
 
+    let sources_path = sources::sources_path(&cache_dir);
+    let configured_sources = if sources_path.exists() {
+        Some(sources_path.to_string_lossy().into_owned())
+    } else {
+        env::var("SOURCES_TOML").ok().filter(|v| !v.is_empty())
+    };
     let source_specs = sources::load_or_default(
-        env::var("SOURCES_TOML").ok().as_deref(),
+        configured_sources.as_deref(),
         (
             dockerhub.registry_url.clone(),
             dockerhub.token_url.clone(),
@@ -235,6 +248,9 @@ async fn main() -> Result<()> {
             ghcr.token_service.clone(),
         ),
     )?;
+    if !sources_path.exists() {
+        sources::save(&sources_path, &source_specs)?;
+    }
     let sources = sources::SourcePool::new(client.clone(), source_specs);
 
     // Certificate precedence: settings-issued (Let's Encrypt via the settings
@@ -268,7 +284,7 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(AppState {
         client,
-        sources,
+        sources: Arc::new(RwLock::new(sources)),
         dockerhub,
         ghcr,
         allowed_registry_hosts,
@@ -283,15 +299,19 @@ async fn main() -> Result<()> {
         accel_addr: accel_addr.clone(),
         ca_path: env::var("CA_CERT_PATH").ok().filter(|v| !v.is_empty()),
         settings_path,
+        sources_path,
         cert_job: Mutex::new(None),
         metrics_history: Arc::new(metrics::History::new()),
         started: Instant::now(),
     });
 
     // Plain HTTP listener: dashboard page + read-only stats/sources/pulls/
-    // downloads/history/healthz. No pull, no settings writes, no cache clear,
-    // no docker.sock actions, no git proxy — anything mutating or
-    // auth-sensitive stays on HTTPS only.
+    // downloads/history/healthz + source-config edits. No pull, no
+    // settings writes, no cache clear, no docker.sock actions, no git
+    // proxy — anything auth-sensitive stays on HTTPS only. Source URLs
+    // are public operational data (not credentials) so the editor is
+    // exposed over plain HTTP for LAN convenience; PUT still validates
+    // https-only registry hosts in `parse_value`.
     let dashboard_app = Router::new()
         .route("/", get(dashboard_redirect))
         .route("/dashboard", get(dashboard))
@@ -301,6 +321,7 @@ async fn main() -> Result<()> {
         .route("/downloads", get(downloads))
         .route("/pulls", get(list_pulls))
         .route("/sources", get(sources_view))
+        .route("/sources/config", get(get_sources_config))
         .fallback(not_found_on_http)
         .with_state(Arc::clone(&state));
 
@@ -311,6 +332,7 @@ async fn main() -> Result<()> {
         .route("/metrics/history", get(metrics_history))
         .route("/downloads", get(downloads))
         .route("/pull", post(start_pull))
+        .route("/pull/warm", post(start_warm))
         .route("/pulls", get(list_pulls))
         .route("/ca.crt", get(serve_ca))
         .route("/settings", get(get_settings).patch(save_settings))
@@ -318,6 +340,10 @@ async fn main() -> Result<()> {
         .route("/settings/dns-records", post(create_dns_records))
         .route("/settings/restart", post(restart_gateway))
         .route("/sources", get(sources_view))
+        .route(
+            "/sources/config",
+            get(get_sources_config).put(save_sources_config),
+        )
         .route("/sources/probe", post(trigger_probe))
         .route("/cache/clear", post(clear_cache))
         .route("/dashboard", get(dashboard))
@@ -354,6 +380,16 @@ async fn main() -> Result<()> {
         None
     };
 
+    let metrics_cache = Arc::clone(&state.cache);
+    let metrics_disk_cap = state.cache.max_bytes();
+    metrics::spawn(
+        Arc::clone(&state.metrics_history),
+        Arc::clone(&state.stats),
+        Arc::clone(&state.sources),
+        Arc::new(move || metrics_cache.bytes_on_disk()),
+        metrics_disk_cap,
+    );
+
     if listeners.len() == 1 && tls_acceptor.is_none() {
         info!(%listen_addr, "listening (HTTP)");
         let server =
@@ -368,21 +404,6 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        // Lift the Arcs the metrics sampler needs out of `state` before it is
-        // moved into `serve_multi`/the router build below.
-        let metrics_history = Arc::clone(&state.metrics_history);
-        let metrics_stats = Arc::clone(&state.stats);
-        let metrics_sources = Arc::clone(&state.sources);
-        let metrics_cache = Arc::clone(&state.cache);
-        let metrics_disk_cap = state.cache.max_bytes();
-        let disk_bytes_fn = Arc::new(move || metrics_cache.bytes_on_disk());
-        metrics::spawn(
-            metrics_history,
-            metrics_stats,
-            metrics_sources,
-            disk_bytes_fn,
-            metrics_disk_cap,
-        );
         serve_multi(
             Arc::new(listeners),
             tls_acceptor,
@@ -499,6 +520,13 @@ async fn serve_multi(
     dashboard_app: Router,
     drain_timeout: u64,
 ) -> Result<()> {
+    // Security boundary: when TLS is configured, a plain-HTTP arrival on
+    // the HTTPS port is treated as a request for the dashboard surface
+    // only (no /pull, no settings writes, no daemon actions). Without
+    // TLS, plain HTTP is the operator's own choice and the full router
+    // is reachable on every listener — same as the single-listener no-TLS
+    // branch in main().
+    let plain_http_full = acceptor.is_none();
     // FuturesUnordered drops a future once it yields, so every accept must
     // re-arm its listener before the next loop turn or the accept loop dies
     // after exactly one connection per port.
@@ -576,13 +604,12 @@ async fn serve_multi(
                     serve_conn(TokioIo::new(tls), full_app, drain_timeout).await;
                 }
                 _ => {
-                    let app = if acceptor.is_some() {
-                        // HTTPS port + plain HTTP -> dashboard-only surface
-                        // (no /pull, no settings writes, no daemon actions).
-                        dashboard_app.clone()
-                    } else {
-                        // No TLS at all: full router over plain HTTP.
+                    let app = if plain_http_full {
                         full_app.clone()
+                    } else {
+                        // HTTPS port + plain HTTP, or any multi-listener plain
+                        // HTTP layout: dashboard-only surface.
+                        dashboard_app.clone()
                     };
                     serve_conn(TokioIo::new(Rewind::new(first, stream)), app, drain_timeout).await;
                 }
@@ -708,12 +735,7 @@ async fn healthz(method: Method) -> Response {
 
 async fn metrics_history(State(state): State<Arc<AppState>>) -> Response {
     let stats = Arc::clone(&state.stats);
-    let snap = metrics::snapshot_now(
-        &stats,
-        &state.sources,
-        state.cache.bytes_on_disk(),
-        state.cache.max_bytes(),
-    );
+    let snap = metrics::snapshot_now(&stats, state.cache.bytes_on_disk(), state.cache.max_bytes());
     match metrics::history_json(&state.metrics_history, snap).await {
         Ok(value) => ([(CONTENT_TYPE, "application/json")], value.to_string()).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}\n")).into_response(),
@@ -721,7 +743,8 @@ async fn metrics_history(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Response {
-    let (chunk_mib, chunk_concurrency) = state.sources.chunk_plan().await;
+    let sources = state.sources.read().await.clone();
+    let (chunk_mib, chunk_concurrency) = sources.chunk_plan().await;
     let body = serde_json::json!({
         "blob_cache_hits": state.stats.blob_hits.load(Ordering::Relaxed),
         "blob_cache_misses": state.stats.blob_misses.load(Ordering::Relaxed),
@@ -1158,6 +1181,333 @@ async fn start_pull(State(state): State<Arc<AppState>>, request: Request) -> Res
     }
 }
 
+/// Cache-preload an image: walk the manifest, then warm every blob into the
+/// content-addressed cache without holding a client connection. Reuses the
+/// chunked downloader's single-flight + resume machinery so the next real
+/// pull hits a warm cache.
+async fn start_warm(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if request.method() != Method::POST {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let bytes = match request.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid body\n").into_response(),
+    };
+    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value,
+        Err(_) => return (StatusCode::BAD_REQUEST, "expected json body\n").into_response(),
+    };
+    let Some(image) = value
+        .get("image")
+        .and_then(|i| i.as_str())
+        .map(str::to_owned)
+    else {
+        return (StatusCode::BAD_REQUEST, "missing \"image\" field\n").into_response();
+    };
+    let parsed = match dockerpull::parse_image_ref(&image) {
+        Ok(parsed) => parsed,
+        Err(error) => return (StatusCode::BAD_REQUEST, format!("{error}\n")).into_response(),
+    };
+    let registry = match parsed.registry.as_str() {
+        "docker.io" => Registry::DockerHub,
+        "ghcr.io" => Registry::Ghcr,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unsupported registry {other}\n"),
+            )
+                .into_response()
+        }
+    };
+    let ref_ = match parsed.tag.clone().or(parsed.digest.clone()) {
+        Some(ref_) => ref_,
+        None => "latest".to_owned(),
+    };
+    let manifest_path = format!("/v2/{}/manifests/{}", parsed.path, ref_);
+
+    // Fetch the manifest. Use the single-image type so the registry returns
+    // the platform-specific manifest instead of a list; the chunked downloader
+    // works one blob at a time. Server-side warm has no inbound
+    // Authorization, so fetch an anonymous bearer from the registry's
+    // configured token endpoint first (matches the docker pull OAuth dance).
+    let accept = "application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json";
+    let token = match fetch_anonymous_token(&state, registry.config(&state), &parsed.path).await {
+        Ok(token) => token,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("warm token fetch: {error}\n"),
+            )
+                .into_response();
+        }
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("accept"),
+        HeaderValue::from_static(accept),
+    );
+    if !token.is_empty() {
+        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) {
+            headers.insert(AUTHORIZATION, value);
+        }
+    }
+    let url = match registry_url(registry.config(&state), &manifest_path, None) {
+        Ok(url) => url,
+        Err(response) => return response,
+    };
+    let upstream =
+        match fetch_following_redirects(&state, url, Method::GET, &headers, None, true).await {
+            Ok(upstream) => upstream,
+            Err(response) => return response,
+        };
+    if !upstream.status().is_success() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("manifest fetch HTTP {}\n", upstream.status()),
+        )
+            .into_response();
+    }
+    let manifest_bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("manifest body read: {error}\n"),
+            )
+                .into_response();
+        }
+    };
+    let digests = match parse_image_manifest_digests(&manifest_bytes) {
+        Ok(digests) => digests,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("manifest parse: {error}\n"),
+            )
+                .into_response();
+        }
+    };
+
+    let mut queued = 0;
+    let mut cached = 0;
+    for (kind, digest) in digests {
+        let Some(hex) = sha256_hex(&digest) else {
+            continue;
+        };
+        if state.cache.lookup(&hex).await.is_some() {
+            cached += 1;
+            continue;
+        }
+        let blob_path = format!("/v2/{}/blobs/{}", parsed.path, digest);
+        // Try (not await) the per-digest inflight lock: holding it for the
+        // full download would make a second /pull/warm POST for the same
+        // image block until the slowest layer finishes. When another warm
+        // already owns the slot, count it as in-progress and move on so the
+        // HTTP request returns promptly.
+        let guard = state.cache.inflight_lock(&hex).await;
+        let flight = match guard.try_lock_owned() {
+            Ok(flight) => flight,
+            Err(_) => {
+                warn!(
+                    image = %image,
+                    digest = %digest,
+                    "warm blob already in flight; skipped"
+                );
+                continue;
+            }
+        };
+        if state.cache.lookup(&hex).await.is_some() {
+            cached += 1;
+            continue;
+        }
+        // chunks::download needs content-length to split the blob into chunks;
+        // a 0-sized call skips the chunk loop silently and never writes the
+        // cache. Resolve size with HEAD before scheduling the download.
+        let size = match head_blob_size(&state, registry, &blob_path, &parsed.path).await {
+            Ok(size) => size,
+            Err(error) => {
+                warn!(
+                    image = %image,
+                    digest = %digest,
+                    error = %error,
+                    "warm HEAD failed; blob skipped"
+                );
+                continue;
+            }
+        };
+        if size == 0 {
+            continue;
+        }
+
+        let part_path = state.cache.new_part_path(&hex);
+        let final_path = state.cache.blob_path(&hex);
+        let sources = state.sources.read().await.clone();
+        let cache_arc = Arc::clone(&state.cache);
+        let stats = Arc::clone(&state.stats);
+        let registry_label = registry.route_prefix().to_owned();
+        let blob_path_for_task = blob_path.clone();
+        let digest_for_task = digest.clone();
+        let client = state.client.clone();
+        let kind_for_log = kind.to_owned();
+        let image_for_log = image.clone();
+        tokio::spawn(async move {
+            let _flight = flight;
+            let result = chunks::download(
+                client,
+                sources,
+                cache_arc,
+                stats,
+                registry_label,
+                blob_path_for_task,
+                digest_for_task.clone(),
+                size,
+                part_path,
+                final_path,
+                None,
+            )
+            .await;
+            if let Err(error) = result {
+                warn!(
+                    image = %image_for_log,
+                    kind = %kind_for_log,
+                    digest = %digest_for_task,
+                    error = %error,
+                    "warm blob download failed"
+                );
+            }
+        });
+        queued += 1;
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        [(CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "status": "warming",
+            "image": image,
+            "queued": queued,
+            "already_cached": cached,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// Minimal OCI/Docker v2 image-manifest parser: extracts every blob digest
+/// referenced by the manifest (config + layers) so the warm flow can preload
+/// them into the cache.
+fn parse_image_manifest_digests(body: &[u8]) -> Result<Vec<(&'static str, String)>> {
+    let value: serde_json::Value = serde_json::from_slice(body).context("invalid json")?;
+    let media_type = value
+        .get("media_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let schema_version = value
+        .get("schemaVersion")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    if media_type.contains("manifest.list")
+        || schema_version == 2 && media_type.is_empty() && value.get("manifests").is_some()
+    {
+        // Manifest list: each entry is itself a platform manifest by digest.
+        if let Some(manifests) = value.get("manifests").and_then(|v| v.as_array()) {
+            for entry in manifests {
+                if let Some(digest) = entry.get("digest").and_then(|v| v.as_str()) {
+                    out.push(("manifest", digest.to_owned()));
+                }
+            }
+        }
+        return Ok(out);
+    }
+    if let Some(config) = value.get("config") {
+        if let Some(digest) = config.get("digest").and_then(|v| v.as_str()) {
+            out.push(("config", digest.to_owned()));
+        }
+    }
+    if let Some(layers) = value.get("layers").and_then(|v| v.as_array()) {
+        for layer in layers {
+            if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
+                out.push(("layer", digest.to_owned()));
+            }
+        }
+    }
+    if out.is_empty() {
+        bail!("manifest has no recognized digest references");
+    }
+    Ok(out)
+}
+
+/// HEAD a blob URL to learn its `Content-Length`. Used by the warm flow
+/// to size each chunked download up front; failures here are logged and
+/// the blob is skipped (no client connection is involved).
+async fn head_blob_size(
+    state: &AppState,
+    registry: Registry,
+    blob_path: &str,
+    repo: &str,
+) -> Result<u64> {
+    let url = registry_url(registry.config(state), blob_path, None)
+        .map_err(|response| anyhow::anyhow!("invalid blob url: {}", response.status()))?;
+    let token = fetch_anonymous_token(state, registry.config(state), repo).await?;
+    let mut headers = HeaderMap::new();
+    if !token.is_empty() {
+        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) {
+            headers.insert(AUTHORIZATION, value);
+        }
+    }
+    let upstream = fetch_following_redirects(state, url, Method::HEAD, &headers, None, true)
+        .await
+        .map_err(|response| anyhow::anyhow!("HEAD not successful: {}", response.status()))?;
+    upstream
+        .content_length()
+        .ok_or_else(|| anyhow::anyhow!("HEAD missing Content-Length"))
+}
+
+/// Fetch an anonymous bearer token for the configured registry's
+/// repository scope (matches the docker pull OAuth dance). Returns an
+/// empty string when the registry has no `token_url` (anonymous mirror)
+/// or when the token endpoint cannot be reached — the caller then falls
+/// back to an unauthenticated request, which works for fully-public blobs
+/// and cleanly errors out for private ones.
+async fn fetch_anonymous_token(
+    state: &AppState,
+    registry_config: &RegistryConfig,
+    repo: &str,
+) -> Result<String> {
+    if registry_config.token_url.is_empty() {
+        return Ok(String::new());
+    }
+    let mut url =
+        url::Url::parse(&registry_config.token_url).context("invalid registry token url")?;
+    {
+        let mut query = url.query_pairs_mut();
+        if !registry_config.token_service.is_empty() {
+            query.append_pair("service", &registry_config.token_service);
+        }
+        query.append_pair("scope", &format!("repository:{repo}:pull"));
+    }
+    let response = state
+        .client
+        .get(url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!("token request: {error}"))?;
+    let text = response
+        .text()
+        .await
+        .map_err(|error| anyhow::anyhow!("token body: {error}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| anyhow::anyhow!("token json: {error}"))?;
+    Ok(value
+        .get("token")
+        .or_else(|| value.get("access_token"))
+        .and_then(|token| token.as_str())
+        .unwrap_or_default()
+        .to_owned())
+}
+
 async fn list_pulls(State(state): State<Arc<AppState>>) -> Response {
     let rows = state.pulls.snapshot().await;
     (
@@ -1168,7 +1518,8 @@ async fn list_pulls(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn sources_view(State(state): State<Arc<AppState>>) -> Response {
-    let snapshot = state.sources.weights_snapshot().await;
+    let sources = state.sources.read().await.clone();
+    let snapshot = sources.weights_snapshot().await;
     let body = serde_json::json!(snapshot
         .iter()
         .map(|(name, weight, stats)| {
@@ -1187,8 +1538,41 @@ async fn sources_view(State(state): State<Arc<AppState>>) -> Response {
     ([(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }
 
+async fn get_sources_config(State(state): State<Arc<AppState>>) -> Response {
+    let sources = state.sources.read().await.clone();
+    (
+        [(CONTENT_TYPE, "application/json")],
+        sources.specs_json().to_string(),
+    )
+        .into_response()
+}
+
+async fn save_sources_config(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let bytes = match request.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid body\n").into_response(),
+    };
+    let value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => value,
+        Err(_) => return (StatusCode::BAD_REQUEST, "expected json body\n").into_response(),
+    };
+    let specs = match sources::parse_value(&value) {
+        Ok(specs) => specs,
+        Err(error) => return (StatusCode::BAD_REQUEST, format!("{error:#}\n")).into_response(),
+    };
+    let mut current = state.sources.write().await;
+    if let Err(error) = sources::save(&state.sources_path, &specs) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}\n")).into_response();
+    }
+    let pool = sources::SourcePool::new(state.client.clone(), specs);
+    let body = pool.specs_json();
+    *current = pool;
+    ([(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
 async fn trigger_probe(State(state): State<Arc<AppState>>) -> Response {
-    state.sources.trigger_probe().await;
+    let sources = state.sources.read().await.clone();
+    sources.trigger_probe();
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -1499,18 +1883,36 @@ async fn proxy_blob(
     let Some(hex) = sha256_hex(&digest) else {
         return passthrough_registry(state, registry, path, host, request).await;
     };
-    if request.headers().contains_key(RANGE) {
-        // Ranged requests bypass the cache and the chunked downloader.
-        return passthrough_registry(state, registry, path, host, request).await;
-    }
+
+    // Parse Range before deciding the cache-vs-upstream split: a valid
+    // single-range request against a cached blob can be served directly from
+    // disk with a 206 (instead of the historical upstream passthrough that
+    // bypassed the cache entirely).
+    let range_header = request
+        .headers()
+        .get(RANGE)
+        .and_then(|value| value.to_str().ok());
 
     if let Some(hit) = state.cache.lookup(&hex).await {
         state.stats.blob_hits.fetch_add(1, Ordering::Relaxed);
+        // bytes_from_cache only counts full reads — partial reads credit
+        // their actual byte length so the dashboard gauge stays honest.
+        let served = match range_header.and_then(|v| parse_single_byte_range(v, hit.size)) {
+            Some(Ok((start, end))) => end.saturating_sub(start).saturating_add(1),
+            Some(Err(())) => 0, // unsatisfiable: nothing served
+            None => hit.size,
+        };
         state
             .stats
             .bytes_from_cache
-            .fetch_add(hit.size, Ordering::Relaxed);
-        return cached_blob_response(hit, head, &digest).await;
+            .fetch_add(served, Ordering::Relaxed);
+        return cached_blob_response(hit, head, &digest, range_header).await;
+    }
+
+    // No cache hit: ranged requests fall through to upstream like before
+    // (single-stream is acceptable; multi-range is not supported here).
+    if range_header.is_some() {
+        return passthrough_registry(state, registry, path, host, request).await;
     }
 
     // Single-flight: one download per digest, late arrivals re-check the cache.
@@ -1521,11 +1923,16 @@ async fn proxy_blob(
     let flight_guard = guard.lock_owned().await;
     if let Some(hit) = state.cache.lookup(&hex).await {
         state.stats.blob_hits.fetch_add(1, Ordering::Relaxed);
+        let served = match range_header.and_then(|v| parse_single_byte_range(v, hit.size)) {
+            Some(Ok((start, end))) => end.saturating_sub(start).saturating_add(1),
+            Some(Err(())) => 0, // unsatisfiable: nothing served
+            None => hit.size,
+        };
         state
             .stats
             .bytes_from_cache
-            .fetch_add(hit.size, Ordering::Relaxed);
-        return cached_blob_response(hit, head, &digest).await;
+            .fetch_add(served, Ordering::Relaxed);
+        return cached_blob_response(hit, head, &digest, range_header).await;
     }
     state.stats.blob_misses.fetch_add(1, Ordering::Relaxed);
 
@@ -1586,7 +1993,7 @@ async fn proxy_blob(
         BLOB_CHANNEL_DEPTH,
     );
 
-    let sources = Arc::clone(&state.sources);
+    let sources = state.sources.read().await.clone();
     let cache = Arc::clone(&state.cache);
     let stats = Arc::clone(&state.stats);
     let path_for_task = path.clone();
@@ -1990,14 +2397,55 @@ async fn buffered_response(upstream: reqwest::Response, head: bool, max_bytes: u
     response
 }
 
-async fn cached_blob_response(hit: CachedBlob, head: bool, digest: &str) -> Response {
-    let builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_LENGTH, hit.size)
+async fn cached_blob_response(
+    hit: CachedBlob,
+    head: bool,
+    digest: &str,
+    range: Option<&str>,
+) -> Response {
+    let parsed = range.and_then(|v| parse_single_byte_range(v, hit.size));
+    let (status, start, len, range_header) = match parsed {
+        Some(Ok((start, end))) => {
+            let len = end - start + 1;
+            (
+                StatusCode::PARTIAL_CONTENT,
+                start,
+                len,
+                Some(format!("bytes {start}-{end}/{}", hit.size)),
+            )
+        }
+        Some(Err(())) => {
+            // Unsatisfiable range (e.g. bytes=-0, bytes=N-M with N >= size):
+            // the cached blob is immutable so a round-trip upstream cannot
+            // change the answer; return 416 with the resource size.
+            let builder = Response::builder().status(StatusCode::RANGE_NOT_SATISFIABLE);
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{}", hit.size)) {
+                return builder
+                    .header(CONTENT_RANGE, value)
+                    .header(
+                        &DOCKER_CONTENT_DIGEST_HEADER,
+                        HeaderValue::from_str(digest)
+                            .unwrap_or(HeaderValue::from_static("unknown")),
+                    )
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+            }
+            return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+        }
+        None => (StatusCode::OK, 0, hit.size, None),
+    };
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header(CONTENT_LENGTH, len)
+        .header(ACCEPT_RANGES, HeaderValue::from_static("bytes"))
         .header(
             &DOCKER_CONTENT_DIGEST_HEADER,
             HeaderValue::from_str(digest).unwrap_or(HeaderValue::from_static("unknown")),
         );
+    if let Some(value) = range_header.and_then(|r| HeaderValue::from_str(&r).ok()) {
+        builder = builder.header(CONTENT_RANGE, value);
+    }
     if head {
         return builder
             .body(Body::empty())
@@ -2005,9 +2453,94 @@ async fn cached_blob_response(hit: CachedBlob, head: bool, digest: &str) -> Resp
     }
     match tokio::fs::File::open(&hit.path).await {
         Ok(file) => builder
-            .body(file_stream(file))
+            .body(file_stream_range(file, start, len))
             .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()),
         Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+/// Stream exactly `len` bytes from `file` starting at `offset`. Any I/O
+/// error short-reads and surfaces the failure to the client.
+fn file_stream_range(file: tokio::fs::File, offset: u64, len: u64) -> Body {
+    let initial = (file, offset, len, vec![0u8; FILE_READ_BUFFER]);
+    let stream = futures_util::stream::unfold(initial, |state| async move {
+        let (mut file, cursor, remaining, mut buf) = state;
+        if remaining == 0 {
+            return None;
+        }
+        if let Err(error) = file.seek(SeekFrom::Start(cursor)).await {
+            // Surface the seek failure: returning None would silently
+            // truncate the 206 body and leave the client with a hole.
+            return Some((Err(error), (file, cursor, 0, buf)));
+        }
+        let want = (remaining.min(buf.len() as u64)) as usize;
+        match file.read_exact(&mut buf[..want]).await {
+            Ok(_read) => {
+                let chunk = Bytes::copy_from_slice(&buf[..want]);
+                Some((
+                    Ok(chunk),
+                    (file, cursor + want as u64, remaining - want as u64, buf),
+                ))
+            }
+            Err(error) => Some((Err(error), (file, cursor, 0, buf))),
+        }
+    });
+    Body::from_stream(stream)
+}
+
+/// Parse a single-range HTTP `Range` header into inclusive `(start, end)`.
+///
+/// Supported forms: `bytes=a-b` (both ends inclusive), `bytes=a-` (open-ended,
+/// end resolves to `size-1`), and `bytes=-b` (suffix range, last `b` bytes).
+/// Multi-range requests, invalid units, or unsatisfiable values return `None`,
+/// signalling the caller to fall back to upstream.
+/// Parse a single-range HTTP `Range` header.
+///
+/// Returns a tri-state:
+/// `None` — malformed (caller falls back to upstream or no-range behavior).
+/// `Some(Err(()))` — RFC 7233 unsatisfiable range (caller returns 416).
+/// `Some(Ok((start, end)))` — inclusive `start..=end` range (caller returns 206).
+///
+/// Supported forms: `bytes=a-b` (both ends inclusive), `bytes=a-` (open-ended,
+/// end resolves to `size-1`), and `bytes=-b` (suffix range, last `b` bytes).
+fn parse_single_byte_range(value: &str, size: u64) -> Option<Result<(u64, u64), ()>> {
+    let rest = value.strip_prefix("bytes=")?;
+    let (start_str, end_str) = rest.split_once('-')?;
+    if start_str.is_empty() && end_str.is_empty() {
+        return None;
+    }
+    if start_str.is_empty() {
+        // bytes=-b: last b bytes
+        let suffix: u64 = end_str.parse().ok()?;
+        if size == 0 {
+            return Some(Err(()));
+        }
+        if suffix == 0 {
+            return Some(Err(()));
+        }
+        let n = suffix.min(size);
+        Some(Ok((size - n, size - 1)))
+    } else {
+        let start: u64 = start_str.parse().ok()?;
+        let end: u64 = if end_str.is_empty() {
+            if size == 0 {
+                return Some(Err(()));
+            }
+            size - 1
+        } else {
+            match end_str.parse::<u64>() {
+                Ok(e) => e,
+                Err(_) => return None,
+            }
+        };
+        if start > end {
+            return Some(Err(()));
+        }
+        if start >= size {
+            return Some(Err(()));
+        }
+        let end = end.min(size - 1);
+        Some(Ok((start, end)))
     }
 }
 

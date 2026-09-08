@@ -154,6 +154,9 @@
   .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 12px; }
   .form-row { display: flex; flex-direction: column; gap: 4px; }
   .form-row label { font-size: 11px; color: var(--muted); }
+  .source-edit { display: grid; grid-template-columns: minmax(120px,.7fr) minmax(240px,1.5fr) minmax(240px,1.5fr) minmax(130px,.8fr) auto; gap: 8px; align-items: end; padding: 10px 0; border-bottom: 1px dashed var(--line); }
+  .source-edit:last-child { border-bottom: none; }
+  .source-edit button { color: var(--bad); }
 
   .badge { display: inline-flex; align-items: center; gap: 5px; padding: 1.5px 9px; border-radius: 999px; font: 600 11px var(--sans); letter-spacing: .03em; }
   .badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
@@ -298,6 +301,8 @@
     .lrow .lst { width: 120px; font-size: 11px; }
     .lane { padding: 9px 2px; }
     .lane .stats { font-size: 11px; gap: 8px; }
+    .source-edit { grid-template-columns: 1fr; }
+    .source-edit button { justify-self: start; }
     .segbar { height: 10px; min-width: 100px; }
     table { font-size: 12px; }
     th, td { padding: 6px 8px; }
@@ -433,7 +438,7 @@
         <div class="gauge"><div class="lbl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg>活跃下载</div><div class="val" id="g-active">–</div><div class="sub" id="g-plan">–</div></div>
       </div>
       <section style="margin-bottom:0">
-        <div class="head" data-no="01"><h2>上游源竞速</h2><span class="aux">权重高则分到更多块</span></div>
+        <div class="head" data-no="01"><h2>上游源竞速</h2><span class="aux">权重高则分到更多块</span><button style="padding:5px 12px;font-size:12px" onclick="gotoSourceEditor()">编辑加速源</button></div>
         <div class="body" id="lanes"></div>
       </section>
     </section>
@@ -457,7 +462,7 @@
       <div class="head" data-no="03"><h2>进行中的下载</h2><span class="aux">2s 实时刷新</span></div>
       <div class="body">
         <table id="downloads">
-          <tr><th>路径</th><th>digest</th><th>分块</th><th>已传输</th><th>耗时</th><th>来源</th></tr>
+          <tr><th>路径</th><th>digest</th><th>分块</th><th>已传输</th><th>耗时</th><th>来源</th><th>速率</th></tr>
         </table>
       </div>
     </section>
@@ -469,7 +474,17 @@
         <div id="lanes-full" style="margin-bottom:14px"></div>
         <div class="btnbar">
           <button onclick="doProbe()">重新测速</button>
+          <button onclick="toggleSourceEditor()">编辑加速源</button>
           <span class="muted" id="probe-status"></span>
+        </div>
+        <div id="source-editor" style="display:none;margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+          <div id="source-rows"></div>
+          <div class="btnbar" style="margin-top:12px">
+            <button onclick="addSourceRow()">添加源</button>
+            <button id="btn-save-sources" class="primary" onclick="doSaveSources()">保存并热加载</button>
+            <span id="source-msg" class="muted"></span>
+          </div>
+          <div class="muted" style="font-size:11px;margin-top:8px">至少保留一个源；地址必须使用 HTTPS 443。</div>
         </div>
       </div>
     </section>
@@ -531,6 +546,34 @@
             <span id="cert-msg" style="font-size:12px;color:var(--fg)"></span>
           </div>
         </div>
+        <div style="border-top:1px dashed var(--line);padding-top:12px;margin-top:14px">
+          <div style="font-size:11px;letter-spacing:.12em;color:var(--muted);text-transform:uppercase;margin-bottom:6px">
+            本机配置生成器（基于上面的加速域名/端口）
+          </div>
+          <div class="row-input" style="margin-bottom:8px">
+            <input id="cfg-snippet-image" type="text" placeholder="例：nginx:alpine · ghcr.io/owner/img:tag">
+            <button onclick="buildClientSnippet()">生成</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap">
+            <span class="badge pulling">docker pull</span>
+            <code id="client-snippet-pull" style="flex:1"></code>
+            <button style="padding:5px 12px" onclick="copyEl('client-snippet-pull')">复制</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap">
+            <span class="badge done">daemon.json</span>
+            <code id="client-snippet-daemon" style="flex:1"></code>
+            <button style="padding:5px 12px" onclick="copyEl('client-snippet-daemon')">复制</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap">
+            <span class="badge new">PULL_VIA_HOST</span>
+            <code id="client-snippet-env" style="flex:1"></code>
+            <button style="padding:5px 12px" onclick="copyEl('client-snippet-env')">复制</button>
+          </div>
+          <div id="client-snippet-err" class="err" style="display:none"></div>
+          <div class="muted" style="font-size:11px;margin-top:8px">
+            加速端口留空默认 4443；未设置加速域名时仅显示 docker daemon 透传模板。
+          </div>
+        </div>
       </div>
     </section>
 
@@ -585,7 +628,7 @@
     overview:  { title: '总览',         sub: '概览 · 缓存 · 加速源',        refresh: { stats: 5000, pulls: 2000, downloads: 2000, sources: 5000 } },
     pulls:     { title: '镜像拉取',     sub: '经网关加速 · 完成后自动重命名', refresh: { pulls: 2000, stats: 5000 } },
     downloads: { title: '下载中',       sub: '分块级进度 · 2s 刷新',           refresh: { downloads: 2000 } },
-    sources:   { title: '上游源',       sub: '实时权重 · 测速详情',            refresh: { sources: 5000 } },
+    sources:   { title: '上游源',       sub: '实时权重 · 测速详情 · 配置编辑', refresh: { sources: 5000 } },
     tools:     { title: '工具',         sub: 'GitHub 加速 · 系统设置 · 证书', refresh: { stats: 10000 } },
   };
   let view = 'overview';
@@ -605,6 +648,10 @@
   function scheduleRefresh() {
     if (refreshTimer) clearInterval(refreshTimer);
     const r = PAGES[view].refresh;
+    // Leaving the downloads/overview views stops /downloads polls; reset
+    // the rate map so the next entry starts a fresh baseline instead of
+    // comparing against a stale timestamp from before the pause.
+    if (!r.downloads) clearDownloadRateMap();
     const interval = Math.min(...Object.values(r));
     refreshTimer = setInterval(refreshForView, interval);
     refreshForView();
@@ -722,19 +769,47 @@
     else cells = Array.from({ length: MAX }, (_, i) => (i + 1) / MAX <= done / Math.max(total, 1));
     return '<div class="segbar">' + cells.map(on => '<i' + (on ? ' class="on"' : '') + '></i>').join('') + '</div>';
   }
+// Per-digest snapshot of (bytes, t) used to derive instantaneous MiB/s
+  // between consecutive /downloads polls. The map is cleared whenever the
+  // user leaves the downloads/overview views so paused intervals don't
+  // skew the rate calculation. Each in-flight fetch carries a generation
+  // tag so a delayed response can't overwrite a fresh one.
+  const downloadRateMap = {};
+  let downloadFetchGen = 0;
+  function clearDownloadRateMap() {
+    for (const key of Object.keys(downloadRateMap)) delete downloadRateMap[key];
+  }
   function loadDownloads() {
+    const myGen = ++downloadFetchGen;
     fetch('/downloads').then(r => r.json()).then(rows => {
+      if (myGen !== downloadFetchGen) return; // stale response, drop
       const tb = document.getElementById('downloads');
       const nav = document.getElementById('nav-dl-count');
       if (nav) nav.textContent = rows.length > 0 ? rows.length + ' 进行' : '';
-      tb.innerHTML = '<tr><th>路径</th><th>digest</th><th>分块</th><th>已传输</th><th>耗时</th><th>来源</th></tr>';
+      tb.innerHTML = '<tr><th>路径</th><th>digest</th><th>分块</th><th>已传输</th><th>耗时</th><th>来源</th><th>速率</th></tr>';
+      const seen = new Set();
+      const now = Date.now();
       if (!rows.length) {
         const tr = document.createElement('tr');
-        tr.innerHTML = '<td colspan="6"><div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6L3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>暂无进行中的下载</div></td>';
+        tr.innerHTML = '<td colspan="7"><div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6L3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 1-1.79 1.11z"/></svg>暂无进行中的下载</div></td>';
         tb.appendChild(tr);
+        clearDownloadRateMap();
         return;
       }
       rows.forEach(d => {
+        const key = String(d.digest);
+        seen.add(key);
+        const bytes = Number(d.bytes_done) || 0;
+        const prev = downloadRateMap[key];
+        let rateText = '–';
+        if (prev) {
+          const dt = (now - prev.t) / 1000;
+          const db = bytes - prev.bytes;
+          if (dt > 0 && db >= 0) {
+            rateText = fmtBytes(db / dt) + '/s';
+          }
+        }
+        downloadRateMap[key] = { bytes, t: now };
         const tr = document.createElement('tr');
         tr.innerHTML =
           '<td class="mono">' + esc(d.path) + '</td>' +
@@ -742,9 +817,13 @@
           '<td style="min-width:200px">' + segbar(d.chunks_total, d.chunks_done) + '</td>' +
           '<td class="mono">' + fmtBytes(d.bytes_done) + ' / ' + fmtBytes(d.total) + '</td>' +
           '<td class="mono muted">' + fmtDur(d.elapsed_secs) + '</td>' +
-          '<td>' + (d.resumed ? '<span class="badge resume">续传</span>' : '<span class="badge new">新下载</span>') + '</td>';
+          '<td>' + (d.resumed ? '<span class="badge resume">续传</span>' : '<span class="badge new">新下载</span>') + '</td>' +
+          '<td class="mono">' + rateText + '</td>';
         tb.appendChild(tr);
       });
+      for (const key of Object.keys(downloadRateMap)) {
+        if (!seen.has(key)) delete downloadRateMap[key];
+      }
     }).catch(() => {});
   }
 
@@ -799,6 +878,74 @@
       const tput = document.getElementById('t-throughput');
       if (tput) tput.textContent = sum > 0 ? fmtBytes(sum) + '/s' : '–';
     }).catch(() => {});
+  }
+  function sourceField(label, key, value, placeholder) {
+    return '<div class="form-row"><label>' + label + '</label><input type="text" data-key="' + key + '" value="' + esc(value || '') + '" placeholder="' + placeholder + '"></div>';
+  }
+  function addSourceRow(source) {
+    const row = document.createElement('div');
+    row.className = 'source-edit';
+    source = source || {};
+    row.innerHTML =
+      sourceField('名称', 'name', source.name, 'dockerhub') +
+      sourceField('Registry URL', 'registry', source.registry, 'https://registry-1.docker.io') +
+      sourceField('Token URL（可空）', 'token', source.token, 'https://auth.docker.io/token') +
+      sourceField('Service（可空）', 'service', source.service, 'registry.docker.io') +
+      '<button type="button" onclick="removeSourceRow(this)">删除</button>';
+    document.getElementById('source-rows').appendChild(row);
+  }
+  function removeSourceRow(button) {
+    const rows = document.querySelectorAll('#source-rows .source-edit');
+    if (rows.length <= 1) { saySource('至少保留一个源', true); return; }
+    button.closest('.source-edit').remove();
+  }
+  function saySource(text, isError) {
+    const el = document.getElementById('source-msg');
+    el.textContent = text;
+    el.className = isError ? 'err' : 'muted';
+  }
+  async function loadSourceConfig() {
+    const box = document.getElementById('source-rows');
+    box.innerHTML = '';
+    try {
+      const r = await fetch('/sources/config');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const j = await r.json();
+      (j.sources || []).forEach(addSourceRow);
+      if (!box.children.length) addSourceRow();
+    } catch (e) { saySource('读取失败: ' + e, true); }
+  }
+  function toggleSourceEditor(open) {
+    const editor = document.getElementById('source-editor');
+    const opening = typeof open === 'boolean' ? open : editor.style.display === 'none';
+    editor.style.display = opening ? 'block' : 'none';
+    if (opening) loadSourceConfig();
+  }
+  function gotoSourceEditor() {
+    view = 'sources';
+    applyView();
+    toggleSourceEditor(true);
+    document.getElementById('source-editor').scrollIntoView({ behavior: 'smooth' });
+  }
+  async function doSaveSources() {
+    const btn = document.getElementById('btn-save-sources');
+    const sources = Array.from(document.querySelectorAll('#source-rows .source-edit')).map(row => {
+      const value = key => row.querySelector('[data-key="' + key + '"]').value.trim();
+      return { name: value('name'), registry: value('registry'), token: value('token'), service: value('service') };
+    });
+    btn.disabled = true;
+    try {
+      const r = await fetch('/sources/config', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sources }),
+      });
+      const text = await r.text();
+      if (!r.ok) throw new Error(text.trim() || ('HTTP ' + r.status));
+      saySource('已保存并热加载');
+      loadSources();
+      loadSourceConfig();
+    } catch (e) { saySource('保存失败: ' + e.message, true); }
+    finally { btn.disabled = false; }
   }
 
   /* ---------- github converter ---------- */
@@ -935,6 +1082,38 @@
       sayCfg('正在重启… 3 秒后刷新');
       setTimeout(() => location.reload(), 3500);
     } catch (e) { sayCfg('重启失败: ' + e, true); }
+  }
+
+  // Build the three artefacts a LAN machine needs to use this gateway:
+  // docker pull line, daemon.json snippet (registry-mirrors), and the
+  // PULL_VIA_HOST value for `docker pull` against pull-as-a-service.
+  function buildClientSnippet() {
+    const err = document.getElementById('client-snippet-err');
+    err.style.display = 'none';
+    const domain = document.getElementById('cfg-accel-domain').value.trim();
+    const port = document.getElementById('cfg-accel-port').value.trim() || '4443';
+    const image = document.getElementById('cfg-snippet-image').value.trim();
+    if (!domain) {
+      err.textContent = '请先在「系统设置」里填写加速域名（docker 域名）。';
+      err.style.display = 'block';
+      return;
+    }
+    // POSIX shell single-quote escape: replace every ' with '\''.
+    // Domain/port have already been validated as hostname chars on save;
+    // only the user-typed image ref needs guarding against injected
+    // `$(...)`, backticks, or command separators.
+    const shellQuote = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+    const pullLine = image
+      ? `docker pull ${domain}:${port}/${shellQuote(image)}`
+      : `# 在 ${domain}:${port} 上拉取镜像：\ndocker pull ${domain}:${port}/<image>:<tag>`;
+    const daemon = JSON.stringify({
+      'registry-mirrors': [`http://${domain}:${port}`],
+      'insecure-registries': [`${domain}:${port}`],
+    }, null, 2);
+    const envLine = `${domain}:${port}`;
+    document.getElementById('client-snippet-pull').textContent = pullLine;
+    document.getElementById('client-snippet-daemon').textContent = daemon;
+    document.getElementById('client-snippet-env').textContent = envLine;
   }
 
   /* ---------- stats (sidebar + topbar) ---------- */

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::cache::Stats;
 use crate::sources::SourcePool;
@@ -57,7 +57,7 @@ impl History {
 pub fn spawn(
     history: Arc<History>,
     stats: Arc<Stats>,
-    sources: Arc<SourcePool>,
+    sources: Arc<RwLock<Arc<SourcePool>>>,
     disk_bytes: Arc<dyn Fn() -> u64 + Send + Sync>,
     disk_cap: u64,
 ) {
@@ -84,7 +84,8 @@ pub fn spawn(
                 .try_lock()
                 .map(|g| g.len() as f64)
                 .unwrap_or(0.0);
-            let snapshot = sources.weights_snapshot().await;
+            let pool = sources.read().await.clone();
+            let snapshot = pool.weights_snapshot().await;
             let mut sum_bps: u64 = 0;
             for (_, weight, stats) in snapshot {
                 if weight > 0.0 {
@@ -104,7 +105,7 @@ pub fn spawn(
 }
 
 /// Current samples from the snapshot — not the history buffer.
-pub fn snapshot_now(stats: &Stats, sources: &SourcePool, disk_bytes: u64, disk_cap: u64) -> Sample {
+pub fn snapshot_now(stats: &Stats, disk_bytes: u64, disk_cap: u64) -> Sample {
     use std::sync::atomic::Ordering;
     let total = stats.blob_hits.load(Ordering::Relaxed) + stats.blob_misses.load(Ordering::Relaxed);
     let hits = stats.blob_hits.load(Ordering::Relaxed);
@@ -190,10 +191,9 @@ mod tests {
     #[test]
     fn snapshot_now_disk_pct_clamped() {
         let s = Stats::default();
-        let pool = SourcePool::for_test();
-        let snap = snapshot_now(&s, &pool, 9500, 10_000);
+        let snap = snapshot_now(&s, 9500, 10_000);
         assert_eq!(snap.disk_pct, 95.0);
-        let snap = snapshot_now(&s, &pool, 11_000, 10_000);
+        let snap = snapshot_now(&s, 11_000, 10_000);
         assert_eq!(snap.disk_pct, 100.0);
     }
 }

@@ -8,12 +8,12 @@
 - **blob 磁盘缓存**：`sha256:<digest>` 即缓存键（OCI blob 不可变），sha256 校验通过才原子落盘；同 digest 并发请求单飞（single-flight），客户端断连也会继续拉完种子缓存
 - **分块并行下载**：按源测速加权选择上游，失败块自动重试；按实测吞吐自适应块大小（8-32MB）与并发（4-16），断点续传沿用旧块大小保证位图兼容
 - **断点续传**：分块位图（`.bitmap` sidecar）记录已完成块，中断后重拉跳过已下载部分
-- **多源测速**：`SOURCES_TOML` 定义多上游，探测 p50/成功率动态加权，异常源自动禁用
+- **多源测速与热编辑**：控制台可增删改上游源，配置持久化到 `/data/sources.json`；探测 p50/成功率动态加权，异常源自动禁用
 - **manifest 内存缓存**：60s TTL，按 Accept 协商头分键
 - **LRU 容量淘汰**：`CACHE_MAX_GB` 超限后按 mtime 淘汰最旧 blob（90% 水位）
 - **GHCR 代理**：`/v2/ghcr.io/...` 路径前缀模式（镜像 tag 改写为 `gateway:20516/ghcr.io/owner/img`）
 - **GitHub 加速**：9 个白名单域名透传（release/raw/codeload/api，git clone 支持）
-- **管理面板与 API**：`/dashboard` 交互面板；`/stats` 缓存指标；`/downloads` 进行中的分块下载；`GET /sources` 源权重与测速；`POST /sources/probe` 触发探测；`POST /cache/clear` 清空 blob 缓存
+- **管理面板与 API**：`/dashboard` 交互面板；`/stats` 缓存指标；`/downloads` 进行中的分块下载；`GET /sources` 源权重与测速；`GET/PUT /sources/config` 查看/热更新源；`POST /sources/probe` 触发探测；`POST /cache/clear` 清空 blob 缓存
 - **镜像拉取工具（类 KSpeeder）**：面板输入镜像名 → 守护进程经本网关拉取（自动吃到多源竞速+缓存）→ 实时展示每层进度 → 完成后自动重命名回原始名称（`POST /pull` + `GET /pulls`）。需把 `/var/run/docker.sock` 挂入容器并 `group_add` docker 组 GID（见 compose.yaml 注释）；仅支持 docker.io / ghcr.io，私有仓库需先 `docker login`
 - **可选 TLS 监听**：设置 `TLS_CERT_PATH` + `TLS_KEY_PATH` 后 `LISTEN_ADDR` 变为 HTTPS 端口（若通过控制台签发了公链证书，自动优先使用公链证书）
 - **动态系统设置与一键证书（类 KSpeeder 体验）**：控制台“系统设置”区可热修改主域名、加速域名、加速端口、LAN IP 与 Cloudflare 凭据（持久化在数据卷 `settings.json`）；支持一键向 Cloudflare 创建 DNS A 记录，一键通过 acme.sh 容器完成 DNS-01 签发 Let's Encrypt 证书并自动热重启加载（公链根信任，客户端免装 CA）
@@ -36,7 +36,7 @@
 | `SHUTDOWN_DRAIN_TIMEOUT_SECS` | 否 | `30` | 停止后排空在途请求的上限 |
 | `PUBLIC_ORIGIN` | 否 | 从请求 Host 推导 | token challenge 的 realm 前缀 |
 | `TLS_CERT_PATH` / `TLS_KEY_PATH` | 否 | 不启用 TLS | 两者必须同时设置；设置后监听端口变为 HTTPS（PEM 格式，支持证书链与 PKCS#8/RSA/EC 私钥） |
-| `SOURCES_TOML` | 否 | 内置 DockerHub/GHCR | 多上游源定义文件路径（JSON，格式见 `docker/sources.example.json`） |
+| `SOURCES_TOML` | 否 | 内置 DockerHub/GHCR | 首次启动导入的多上游源 JSON；之后以 `/data/sources.json` 和控制台配置为准 |
 | `DOCKERHUB_REGISTRY_URL` | 否 | `https://registry-1.docker.io` | Docker Hub 上游 |
 | `DOCKERHUB_TOKEN_URL` | 否 | `https://auth.docker.io/token` | Docker Hub token 端点 |
 | `DOCKERHUB_TOKEN_SERVICE` | 否 | `registry.docker.io` | token service 参数 |
