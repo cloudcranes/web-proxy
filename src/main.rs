@@ -223,22 +223,18 @@ async fn main() -> Result<()> {
         if let Some(ca_path) = env::var("CA_CERT_PATH").ok().filter(|v| !v.is_empty()) {
             match std::fs::read(&ca_path) {
                 Ok(bytes) => {
-                    let mut loaded = 0usize;
-                    for cert in rustls_pemfile::certs(&mut bytes.as_slice()) {
-                        match cert {
-                            Ok(der) => {
-                                builder = builder.add_root_certificate(
-                                    reqwest::tls::Certificate::from_der(der.as_ref()).map_err(
-                                        |e| anyhow::anyhow!("bad cert in {ca_path}: {e}"),
-                                    )?,
-                                );
-                                loaded += 1;
-                            }
-                            Err(error) => warn!(%error, "skipping invalid PEM entry in {ca_path}"),
+                    // reqwest::tls::Certificate::from_pem accepts a PEM bundle
+                    // (one or more CERTIFICATE blocks) directly, so we avoid
+                    // pulling in a separate pemfile crate whose platform-
+                    // specific bits break arm64 cross-compile in CI.
+                    match reqwest::tls::Certificate::from_pem(&bytes) {
+                        Ok(cert) => {
+                            builder = builder.add_root_certificate(cert);
+                            info!(path = %ca_path, "loaded CA bundle");
                         }
-                    }
-                    if loaded > 0 {
-                        info!(path = %ca_path, count = loaded, "loaded CA bundle");
+                        Err(error) => {
+                            warn!(path = %ca_path, %error, "CA_CERT_PATH parse failed")
+                        }
                     }
                 }
                 Err(error) => warn!(path = %ca_path, %error, "CA_CERT_PATH read failed"),
