@@ -130,6 +130,13 @@ struct AppState {
     cert_job: Mutex<Option<Value>>,
     metrics_history: Arc<metrics::History>,
     logs: Arc<logs::Logs>,
+    /// Optional bearer token gating destructive write endpoints. When set,
+    /// POST/PUT/PATCH/DELETE on /pull, /pull/warm, /sources/config,
+    /// /sources/probe, /cache/clear, /settings and /settings/* must carry
+    /// `Authorization: Bearer <token>`. Reads stay open so the dashboard
+    /// and metrics scrapers keep working. LAN deployments without
+    /// internet exposure can leave this unset.
+    mgmt_bearer: Option<String>,
     started: Instant,
 }
 
@@ -305,6 +312,7 @@ async fn main() -> Result<()> {
         cert_job: Mutex::new(None),
         metrics_history: Arc::new(metrics::History::new()),
         logs: Arc::new(logs::Logs::new()),
+        mgmt_bearer: env::var("MGMT_BEARER_TOKEN").ok().filter(|v| !v.is_empty()),
         started: Instant::now(),
     });
 
@@ -832,6 +840,9 @@ async fn get_settings(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn save_settings(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if let Some(resp) = require_mgmt_auth(&state, &request) {
+        return resp;
+    }
     if request.method() != Method::PATCH {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
@@ -856,7 +867,10 @@ async fn save_settings(State(state): State<Arc<AppState>>, request: Request) -> 
 /// Run acme.sh in a one-shot container to issue the public certificate for
 /// the configured domain family; on success the container restarts itself so
 /// the new certificate is loaded (cert paths take precedence over env TLS).
-async fn issue_cert(State(state): State<Arc<AppState>>) -> Response {
+async fn issue_cert(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if let Some(resp) = require_mgmt_auth(&state, &request) {
+        return resp;
+    }
     let settings = settings::Settings::load(&state.settings_path);
     let (domain, token, zone, account) = match (
         settings.domain.clone(),
@@ -966,7 +980,10 @@ async fn issue_cert(State(state): State<Arc<AppState>>) -> Response {
     (StatusCode::ACCEPTED, "certificate issuance started\n").into_response()
 }
 
-async fn create_dns_records(State(state): State<Arc<AppState>>) -> Response {
+async fn create_dns_records(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if let Some(resp) = require_mgmt_auth(&state, &request) {
+        return resp;
+    }
     let settings = settings::Settings::load(&state.settings_path);
     let (Some(domain), Some(lan_ip), Some(token)) = (
         settings.domain.as_deref(),
@@ -1090,7 +1107,10 @@ async fn create_dns_records(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-async fn restart_gateway(State(_state): State<Arc<AppState>>) -> Response {
+async fn restart_gateway(State(_state): State<Arc<AppState>>, request: Request) -> Response {
+    if let Some(resp) = require_mgmt_auth(&_state, &request) {
+        return resp;
+    }
     let socket = env_or("DOCKER_SOCKET", "/var/run/docker.sock");
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1136,6 +1156,9 @@ async fn serve_ca(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn start_pull(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if let Some(resp) = require_mgmt_auth(&state, &request) {
+        return resp;
+    }
     if request.method() != Method::POST {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
@@ -1208,6 +1231,9 @@ async fn start_pull(State(state): State<Arc<AppState>>, request: Request) -> Res
 /// chunked downloader's single-flight + resume machinery so the next real
 /// pull hits a warm cache.
 async fn start_warm(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if let Some(resp) = require_mgmt_auth(&state, &request) {
+        return resp;
+    }
     if request.method() != Method::POST {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
@@ -1588,6 +1614,9 @@ async fn get_sources_config(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn save_sources_config(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if let Some(resp) = require_mgmt_auth(&state, &request) {
+        return resp;
+    }
     let bytes = match request.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid body\n").into_response(),
@@ -1610,7 +1639,10 @@ async fn save_sources_config(State(state): State<Arc<AppState>>, request: Reques
     ([(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }
 
-async fn trigger_probe(State(state): State<Arc<AppState>>) -> Response {
+async fn trigger_probe(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if let Some(resp) = require_mgmt_auth(&state, &request) {
+        return resp;
+    }
     let sources = state.sources.read().await.clone();
     sources.trigger_probe();
     StatusCode::ACCEPTED.into_response()
@@ -1647,7 +1679,10 @@ fn record_log(
     logs.record(route, method, status, duration, category, truncated);
 }
 
-async fn clear_cache(State(state): State<Arc<AppState>>) -> Response {
+async fn clear_cache(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if let Some(resp) = require_mgmt_auth(&state, &request) {
+        return resp;
+    }
     // Clearing while a chunked download is mid-flight deletes its .part and
     // dooms that transfer's commit (the client retry self-heals), so surface
     // the count instead of failing the request.
@@ -3050,6 +3085,52 @@ fn registry_config(
 fn upstream_error(error: reqwest::Error) -> Response {
     warn!(%error, "upstream request failed");
     (StatusCode::BAD_GATEWAY, "upstream request failed\n").into_response()
+}
+
+/// Gate a management endpoint behind the configured bearer token.
+/// Returns `Some(401 response)` when the token is set and the request
+/// doesn't carry a matching `Authorization: Bearer <token>` header;
+/// returns `None` to let the handler run.
+///
+/// Only mutating verbs are checked so the dashboard and metrics scrapers
+/// don't need the token. The check is constant-time per byte to avoid
+/// timing-leak token recovery.
+fn require_mgmt_auth(state: &AppState, request: &Request) -> Option<Response> {
+    let expected = state.mgmt_bearer.as_deref()?;
+    let method = request.method();
+    if !matches!(
+        method,
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    ) {
+        return None;
+    }
+    let supplied = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("");
+    // Constant-time compare on equal-length prefixes so a remote attacker
+    // can't recover the token byte-by-byte from response timing.
+    let matches = supplied.len() == expected.len()
+        && supplied
+            .as_bytes()
+            .iter()
+            .zip(expected.as_bytes().iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+    if matches {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                [(WWW_AUTHENTICATE, "Bearer realm=\"web-proxy\"")],
+                "missing or invalid bearer token\n",
+            )
+                .into_response(),
+        )
+    }
 }
 
 fn env_or(name: &str, default: &str) -> String {
