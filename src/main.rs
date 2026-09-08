@@ -130,6 +130,10 @@ struct AppState {
     cert_job: Mutex<Option<Value>>,
     metrics_history: Arc<metrics::History>,
     logs: Arc<logs::Logs>,
+    /// Serializes concurrent /settings PATCHes so a load+apply+save pair
+    /// can't interleave with another writer and drop fields (last-writer
+    /// silently overwrites the other).
+    settings_lock: tokio::sync::Mutex<()>,
     /// Optional bearer token gating destructive write endpoints. When set,
     /// POST/PUT/PATCH/DELETE on /pull, /pull/warm, /sources/config,
     /// /sources/probe, /cache/clear, /settings and /settings/* must carry
@@ -202,18 +206,46 @@ async fn main() -> Result<()> {
     let manifest_entries = env_parse("MANIFEST_CACHE_ENTRIES", 2048_usize)?;
     let manifests = ManifestCache::new(Duration::from_secs(manifest_ttl), manifest_entries);
 
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(connect_timeout))
-        .read_timeout(Duration::from_secs(1800))
-        // Adaptive H2 window tuning handles initial-stream/connection
-        // sizing internally; the two `initial_*` setters would be ignored
-        // while this is true.
-        .http2_adaptive_window(true)
-        .pool_max_idle_per_host(32)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .redirect(Policy::none())
-        .build()
-        .context("build HTTP client")?;
+    let client = {
+        let mut builder = Client::builder()
+            .connect_timeout(Duration::from_secs(connect_timeout))
+            .read_timeout(Duration::from_secs(1800))
+            // Adaptive H2 window tuning handles initial-stream/connection
+            // sizing internally; the two `initial_*` setters would be ignored
+            // while this is true.
+            .http2_adaptive_window(true)
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .redirect(Policy::none());
+        // Load the operator-supplied CA bundle (e.g. self-signed registry on
+        // the LAN) into the outgoing trust store so the gateway can pull
+        // from sources whose cert isn't in webpki-roots.
+        if let Some(ca_path) = env::var("CA_CERT_PATH").ok().filter(|v| !v.is_empty()) {
+            match std::fs::read(&ca_path) {
+                Ok(bytes) => {
+                    let mut loaded = 0usize;
+                    for cert in rustls_pemfile::certs(&mut bytes.as_slice()) {
+                        match cert {
+                            Ok(der) => {
+                                builder = builder.add_root_certificate(
+                                    reqwest::tls::Certificate::from_der(der.as_ref()).map_err(
+                                        |e| anyhow::anyhow!("bad cert in {ca_path}: {e}"),
+                                    )?,
+                                );
+                                loaded += 1;
+                            }
+                            Err(error) => warn!(%error, "skipping invalid PEM entry in {ca_path}"),
+                        }
+                    }
+                    if loaded > 0 {
+                        info!(path = %ca_path, count = loaded, "loaded CA bundle");
+                    }
+                }
+                Err(error) => warn!(path = %ca_path, %error, "CA_CERT_PATH read failed"),
+            }
+        }
+        builder.build().context("build HTTP client")?
+    };
 
     let mut allowed_registry_hosts: HashSet<String> = HashSet::new();
     for config in [&dockerhub, &ghcr] {
@@ -312,6 +344,7 @@ async fn main() -> Result<()> {
         cert_job: Mutex::new(None),
         metrics_history: Arc::new(metrics::History::new()),
         logs: Arc::new(logs::Logs::new()),
+        settings_lock: tokio::sync::Mutex::new(()),
         mgmt_bearer: env::var("MGMT_BEARER_TOKEN").ok().filter(|v| !v.is_empty()),
         started: Instant::now(),
     });
@@ -854,8 +887,10 @@ async fn save_settings(State(state): State<Arc<AppState>>, request: Request) -> 
         return (StatusCode::BAD_REQUEST, "expected json body\n").into_response();
     };
     let patch = settings::patch_from_body(&value);
-    let current = settings::Settings::load(&state.settings_path);
-    match current.apply(patch, &state.settings_path) {
+    // Serial tx: lock the load+apply+save window so two concurrent
+    // PATCHes can't read the same baseline and lose each other's fields.
+    let _guard = state.settings_lock.lock().await;
+    match settings::Settings::load(&state.settings_path).apply(patch, &state.settings_path) {
         Ok(updated) => {
             let view = settings::settings_view(&updated, Value::Null);
             ([(CONTENT_TYPE, "application/json")], view.to_string()).into_response()
@@ -1407,6 +1442,7 @@ async fn start_warm(State(state): State<Arc<AppState>>, request: Request) -> Res
         let digest_for_task = digest.clone();
         let client = state.client.clone();
         let kind_for_log = kind.to_owned();
+        let allowed_hosts_warm = Arc::new(state.allowed_registry_hosts.clone());
         let image_for_log = image.clone();
         tokio::spawn(async move {
             let _flight = flight;
@@ -1422,6 +1458,7 @@ async fn start_warm(State(state): State<Arc<AppState>>, request: Request) -> Res
                 part_path,
                 final_path,
                 None,
+                allowed_hosts_warm,
             )
             .await;
             if let Err(error) = result {
@@ -2232,6 +2269,7 @@ async fn proxy_blob(
     let registry_label = registry.route_prefix().to_owned();
     let client = state.client.clone();
     let tx_clone = tx.clone();
+    let allowed_hosts = Arc::new(state.allowed_registry_hosts.clone());
     tokio::spawn(async move {
         let _flight_guard = flight_guard;
         let result = chunks::download(
@@ -2246,6 +2284,7 @@ async fn proxy_blob(
             part_path,
             final_path,
             Some(tx_clone),
+            allowed_hosts,
         )
         .await;
         if let Err(error) = result {
@@ -2480,22 +2519,18 @@ async fn passthrough_registry(
 }
 
 async fn proxy_github(state: &AppState, url: Url, request: Request) -> Response {
-    if !matches!(*request.method(), Method::GET | Method::HEAD | Method::POST) {
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        // Read-only: block POST/PUT/DELETE so the gateway can't be used as
+        // a write proxy for GitHub APIs (comment creation, gist updates,
+        // webhook delivery). The fallback route is not gated by
+        // MGMT_BEARER, so without this an internet-exposed HTTPS port
+        // would forward writes from any caller.
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
 
     let method = request.method().clone();
     let headers = request.headers().clone();
-    let body = if method == Method::POST {
-        match request.into_body().collect().await {
-            Ok(collected) => Some(collected.to_bytes()),
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-        }
-    } else {
-        None
-    };
-
-    match fetch_following_redirects(state, url, method, &headers, body, false).await {
+    match fetch_following_redirects(state, url, method, &headers, None, false).await {
         Ok(response) => streaming_response(response, false),
         Err(response) => response,
     }

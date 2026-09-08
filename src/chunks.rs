@@ -14,6 +14,7 @@
 //! cancelled mid-way, already-fetched chunks are reused directly from disk
 //! without touching upstream networks.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -122,6 +123,7 @@ pub async fn download(
     part_path: PathBuf,
     final_path: PathBuf,
     mut tx: Option<mpsc::Sender<Result<Bytes, std::io::Error>>>,
+    allowed_hosts: Arc<std::collections::HashSet<String>>,
 ) -> Result<String> {
     let bitmap_path = part_path.with_extension("bitmap");
 
@@ -206,6 +208,7 @@ pub async fn download(
         let pool = Arc::clone(&pool);
         let path = path.clone();
         let chunk = *chunk;
+        let allowed_hosts = Arc::clone(&allowed_hosts);
 
         tasks.spawn(async move {
             if is_already_done {
@@ -239,6 +242,7 @@ pub async fn download(
                     chunk.length,
                     shared.as_ref(),
                     total_received.as_ref(),
+                    &allowed_hosts,
                 )
                 .await
                 {
@@ -380,6 +384,7 @@ async fn fetch_chunk(
     length: u64,
     file: &tokio::sync::Mutex<tokio::fs::File>,
     total_received: &std::sync::atomic::AtomicU64,
+    allowed_hosts: &std::collections::HashSet<String>,
 ) -> Result<u64> {
     let mut current_url = initial_url.clone();
     let mut use_auth = true;
@@ -410,7 +415,18 @@ async fn fetch_chunk(
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| anyhow::anyhow!("missing Location header in redirect"))?;
             let next_url = current_url.join(location)?;
+            // Reject cross-host redirects that leave the configured
+            // registry allowlist: a compromised mirror could otherwise
+            // chain the gateway into fetching from link-local / private
+            // networks (SSRF). Same-host redirects skip the check.
             if next_url.host_str() != current_url.host_str() {
+                let next_host = next_url.host_str().unwrap_or("").to_ascii_lowercase();
+                if !allowed_hosts.contains(&next_host) {
+                    bail!(
+                        "chunk {offset} redirect to off-allowlist host {} refused",
+                        next_host
+                    );
+                }
                 // Cross-host redirect (e.g. to CDN): drop Bearer auth as S3/R2 signed URLs use query auth
                 use_auth = false;
             }
