@@ -1,6 +1,7 @@
 mod cache;
 mod chunks;
 mod dockerpull;
+mod logs;
 mod metrics;
 mod settings;
 mod sources;
@@ -128,6 +129,7 @@ struct AppState {
     sources_path: PathBuf,
     cert_job: Mutex<Option<Value>>,
     metrics_history: Arc<metrics::History>,
+    logs: Arc<logs::Logs>,
     started: Instant,
 }
 
@@ -302,6 +304,7 @@ async fn main() -> Result<()> {
         sources_path,
         cert_job: Mutex::new(None),
         metrics_history: Arc::new(metrics::History::new()),
+        logs: Arc::new(logs::Logs::new()),
         started: Instant::now(),
     });
 
@@ -325,6 +328,7 @@ async fn main() -> Result<()> {
             "/sources/config",
             get(get_sources_config).put(save_sources_config),
         )
+        .route("/logs", get(get_logs))
         .fallback(not_found_on_http)
         .with_state(Arc::clone(&state));
 
@@ -348,6 +352,7 @@ async fn main() -> Result<()> {
             get(get_sources_config).put(save_sources_config),
         )
         .route("/sources/probe", post(trigger_probe))
+        .route("/logs", get(get_logs))
         .route("/cache/clear", post(clear_cache))
         .route("/dashboard", get(dashboard))
         .fallback(proxy)
@@ -977,16 +982,21 @@ async fn create_dns_records(State(state): State<Arc<AppState>>) -> Response {
 
     let api = "https://api.cloudflare.com/client/v4";
     let auth = [("Authorization", format!("Bearer {token}"))];
+    let auth_value = match HeaderValue::from_str(&auth[0].1) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "cf_token contains characters not allowed in HTTP headers\n".to_string(),
+            )
+                .into_response();
+        }
+    };
     let zone_lookup = match state
         .client
         .get(format!("{api}/zones"))
         .query(&[("name", domain)])
-        .headers(HeaderMap::from_iter(auth.iter().map(|(k, v)| {
-            (
-                HeaderName::from_static(k),
-                HeaderValue::from_str(v).unwrap(),
-            )
-        })))
+        .header("Authorization", auth_value)
         .send()
         .await
     {
@@ -1148,12 +1158,21 @@ async fn start_pull(State(state): State<Arc<AppState>>, request: Request) -> Res
                     .rsplit_once(':')
                     .map(|(name, _)| name.trim_start_matches('[').trim_end_matches(']'))
                     .unwrap_or(header);
-                if name == "localhost" || name.parse::<IpAddr>().is_ok() {
+                // Accept only loopback. A private / link-local IP literal
+                // (e.g. `169.254.169.254`) still bypasses the Host-as-domain
+                // check above and would tell the daemon to pull from an
+                // internal endpoint the operator never authorized.
+                let is_loopback = match name.parse::<IpAddr>() {
+                    Ok(IpAddr::V4(v4)) => v4.is_loopback(),
+                    Ok(IpAddr::V6(v6)) => v6.is_loopback(),
+                    Err(_) => name == "localhost",
+                };
+                if is_loopback {
                     header.to_owned()
                 } else {
                     return (
                         StatusCode::BAD_REQUEST,
-                        "refusing Host header that is not an IP literal; set PULL_VIA_HOST\n",
+                        "refusing Host header that is not a loopback address; set PULL_VIA_HOST\n",
                     )
                         .into_response();
                 }
@@ -1293,7 +1312,17 @@ async fn start_warm(State(state): State<Arc<AppState>>, request: Request) -> Res
 
     let mut queued = 0;
     let mut cached = 0;
+    let mut skipped_kind = 0;
     for (kind, digest) in digests {
+        // Manifest-list children are platform manifests, not blobs. Pulling
+        // them via /blobs/ writes manifests into the blob cache and breaks
+        // any future blob GET that happens to land on the same digest (rare
+        // but real). Recursing into manifests is out of scope for a warm —
+        // the chunked downloader handles individual blobs only.
+        if kind != "blob" {
+            skipped_kind += 1;
+            continue;
+        }
         let Some(hex) = sha256_hex(&digest) else {
             continue;
         };
@@ -1390,6 +1419,7 @@ async fn start_warm(State(state): State<Arc<AppState>>, request: Request) -> Res
             "image": image,
             "queued": queued,
             "already_cached": cached,
+            "skipped_kind": skipped_kind,
         })
         .to_string(),
     )
@@ -1409,6 +1439,13 @@ fn parse_image_manifest_digests(body: &[u8]) -> Result<Vec<(&'static str, String
         .get("schemaVersion")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
+    // Schema 1 manifests use per-blob SHA + JSON signatures with a different
+    // digest layout that the chunked downloader cannot verify. Reject up
+    // front so the warm doesn't half-process them and the proxy surfaces a
+    // clear 400 instead of a misleading 502 from the sha256 check.
+    if schema_version == 1 {
+        bail!("schemaVersion 1 manifests are unsupported");
+    }
     let mut out = Vec::new();
     if media_type.contains("manifest.list")
         || schema_version == 2 && media_type.is_empty() && value.get("manifests").is_some()
@@ -1577,6 +1614,37 @@ async fn trigger_probe(State(state): State<Arc<AppState>>) -> Response {
     let sources = state.sources.read().await.clone();
     sources.trigger_probe();
     StatusCode::ACCEPTED.into_response()
+}
+
+async fn get_logs(State(state): State<Arc<AppState>>) -> Response {
+    let entries = state.logs.snapshot();
+    let body = serde_json::json!({
+        "count": entries.len(),
+        "entries": entries.iter().rev().map(|e| e.to_json()).collect::<Vec<_>>(),
+    });
+    ([(CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
+/// Record a single log entry for a gateway decision. Truncates `note`
+/// to 160 chars so a 500-entry ring stays cheap.
+fn record_log(
+    logs: &logs::Logs,
+    route: &str,
+    method: &str,
+    status: u16,
+    duration: std::time::Duration,
+    category: &'static str,
+    note: impl Into<String>,
+) {
+    let note = note.into();
+    let truncated: String = if note.chars().count() > 160 {
+        // Take 159 chars + ellipsis = 160 total, matching the docstring on
+        // `record_log` that promises "to 160 chars".
+        note.chars().take(159).collect::<String>() + "…"
+    } else {
+        note
+    };
+    logs.record(route, method, status, duration, category, truncated);
 }
 
 async fn clear_cache(State(state): State<Arc<AppState>>) -> Response {
@@ -1883,24 +1951,40 @@ async fn proxy_blob(
     request: Request,
 ) -> Response {
     let head = request.method() == Method::HEAD;
+    let started = std::time::Instant::now();
     let Some(hex) = sha256_hex(&digest) else {
-        return passthrough_registry(state, registry, path, host, request).await;
+        let method_label = request.method().as_str().to_owned();
+        let resp = passthrough_registry(state, registry, path, host, request).await;
+        record_log(
+            &state.logs,
+            "/v2/*/blobs/*",
+            &method_label,
+            resp.status().as_u16(),
+            started.elapsed(),
+            "passthrough",
+            format!("digest parse failed: {digest}"),
+        );
+        return resp;
     };
 
     // Parse Range before deciding the cache-vs-upstream split: a valid
     // single-range request against a cached blob can be served directly from
     // disk with a 206 (instead of the historical upstream passthrough that
     // bypassed the cache entirely).
-    let range_header = request
+    let range_header: Option<String> = request
         .headers()
         .get(RANGE)
-        .and_then(|value| value.to_str().ok());
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
 
     if let Some(hit) = state.cache.lookup(&hex).await {
         state.stats.blob_hits.fetch_add(1, Ordering::Relaxed);
         // bytes_from_cache only counts full reads — partial reads credit
         // their actual byte length so the dashboard gauge stays honest.
-        let served = match range_header.and_then(|v| parse_single_byte_range(v, hit.size)) {
+        let served = match range_header
+            .as_deref()
+            .and_then(|v| parse_single_byte_range(v, hit.size))
+        {
             Some(Ok((start, end))) => end.saturating_sub(start).saturating_add(1),
             Some(Err(())) => 0, // unsatisfiable: nothing served
             None => hit.size,
@@ -1909,13 +1993,54 @@ async fn proxy_blob(
             .stats
             .bytes_from_cache
             .fetch_add(served, Ordering::Relaxed);
-        return cached_blob_response(hit, head, &digest, range_header).await;
+        let hit_size = hit.size;
+        let is_range = range_header.is_some();
+        let resp = cached_blob_response(
+            state,
+            registry,
+            path,
+            host,
+            &hex,
+            hit,
+            head,
+            &digest,
+            range_header,
+            request,
+        )
+        .await;
+        record_log(
+            &state.logs,
+            "/v2/*/blobs/*",
+            // request moved into cached_blob_response; fall-back path is
+            // upstream so the method we recorded there is the same.
+            "GET",
+            resp.status().as_u16(),
+            started.elapsed(),
+            if is_range {
+                "cache_hit_range"
+            } else {
+                "cache_hit"
+            },
+            format!("hex={} size={} served={}", &hex[..8], hit_size, served),
+        );
+        return resp;
     }
 
     // No cache hit: ranged requests fall through to upstream like before
     // (single-stream is acceptable; multi-range is not supported here).
     if range_header.is_some() {
-        return passthrough_registry(state, registry, path, host, request).await;
+        let method_label = request.method().as_str().to_owned();
+        let resp = passthrough_registry(state, registry, path, host, request).await;
+        record_log(
+            &state.logs,
+            "/v2/*/blobs/*",
+            &method_label,
+            resp.status().as_u16(),
+            started.elapsed(),
+            "upstream_range_miss",
+            format!("hex={} miss+ranged", &hex[..8]),
+        );
+        return resp;
     }
 
     // Single-flight: one download per digest, late arrivals re-check the cache.
@@ -1926,7 +2051,10 @@ async fn proxy_blob(
     let flight_guard = guard.lock_owned().await;
     if let Some(hit) = state.cache.lookup(&hex).await {
         state.stats.blob_hits.fetch_add(1, Ordering::Relaxed);
-        let served = match range_header.and_then(|v| parse_single_byte_range(v, hit.size)) {
+        let served = match range_header
+            .as_deref()
+            .and_then(|v| parse_single_byte_range(v, hit.size))
+        {
             Some(Ok((start, end))) => end.saturating_sub(start).saturating_add(1),
             Some(Err(())) => 0, // unsatisfiable: nothing served
             None => hit.size,
@@ -1935,7 +2063,31 @@ async fn proxy_blob(
             .stats
             .bytes_from_cache
             .fetch_add(served, Ordering::Relaxed);
-        return cached_blob_response(hit, head, &digest, range_header).await;
+        let resp = cached_blob_response(
+            state,
+            registry,
+            path,
+            host,
+            &hex,
+            hit,
+            head,
+            &digest,
+            range_header,
+            request,
+        )
+        .await;
+        record_log(
+            &state.logs,
+            "/v2/*/blobs/*",
+            // request moved into cached_blob_response; both code paths
+            // inside it forward the original method.
+            "GET",
+            resp.status().as_u16(),
+            started.elapsed(),
+            "cache_hit_flight",
+            format!("hex={} served={}", &hex[..8], served),
+        );
+        return resp;
     }
     state.stats.blob_misses.fetch_add(1, Ordering::Relaxed);
 
@@ -1955,15 +2107,47 @@ async fn proxy_blob(
     .await
     {
         Ok(upstream) => upstream,
-        Err(response) => return response,
+        Err(response) => {
+            record_log(
+                &state.logs,
+                "/v2/*/blobs/*",
+                request.method().as_str(),
+                response.status().as_u16(),
+                started.elapsed(),
+                "upstream_error",
+                format!("hex={} redirect/connect", &hex[..8]),
+            );
+            return response;
+        }
     };
     if !upstream.status().is_success() {
+        let status = upstream.status().as_u16();
         let mut response = streaming_response(upstream, head);
         rewrite_401_challenge(&mut response, registry, &path, &origin);
+        record_log(
+            &state.logs,
+            "/v2/*/blobs/*",
+            request.method().as_str(),
+            status,
+            started.elapsed(),
+            "upstream_status",
+            format!("hex={} upstream={}", &hex[..8], status),
+        );
         return response;
     }
     if head {
-        return streaming_response(upstream, true);
+        let status = upstream.status().as_u16();
+        let resp = streaming_response(upstream, true);
+        record_log(
+            &state.logs,
+            "/v2/*/blobs/*",
+            "HEAD",
+            status,
+            started.elapsed(),
+            "upstream_head",
+            format!("hex={}", &hex[..8]),
+        );
+        return resp;
     }
 
     let content_length = upstream.content_length();
@@ -1977,7 +2161,7 @@ async fn proxy_blob(
         None => {
             // Chunked downloads need an explicit size. Fall back to the
             // single-source streamer so the client still gets the blob.
-            return single_source_blob_fallback(
+            let resp = single_source_blob_fallback(
                 state,
                 registry,
                 path.clone(),
@@ -1987,6 +2171,16 @@ async fn proxy_blob(
                 flight_guard,
             )
             .await;
+            record_log(
+                &state.logs,
+                "/v2/*/blobs/*",
+                request.method().as_str(),
+                resp.status().as_u16(),
+                started.elapsed(),
+                "fallback_single",
+                format!("hex={} no Content-Length", &hex[..8]),
+            );
+            return resp;
         }
     };
 
@@ -2001,7 +2195,6 @@ async fn proxy_blob(
     let stats = Arc::clone(&state.stats);
     let path_for_task = path.clone();
     let registry_label = registry.route_prefix().to_owned();
-    let hex_for_task = hex.clone();
     let client = state.client.clone();
     let tx_clone = tx.clone();
     tokio::spawn(async move {
@@ -2401,12 +2594,20 @@ async fn buffered_response(upstream: reqwest::Response, head: bool, max_bytes: u
 }
 
 async fn cached_blob_response(
+    state: &AppState,
+    registry: Registry,
+    path: String,
+    host: &str,
+    hex: &str,
     hit: CachedBlob,
     head: bool,
     digest: &str,
-    range: Option<&str>,
+    range: Option<String>,
+    request: Request,
 ) -> Response {
-    let parsed = range.and_then(|v| parse_single_byte_range(v, hit.size));
+    let parsed = range
+        .as_deref()
+        .and_then(|v| parse_single_byte_range(v, hit.size));
     let (status, start, len, range_header) = match parsed {
         Some(Ok((start, end))) => {
             let len = end - start + 1;
@@ -2458,6 +2659,19 @@ async fn cached_blob_response(
         Ok(file) => builder
             .body(file_stream_range(file, start, len))
             .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Race: eviction removed the blob between `lookup` and `open`.
+            // Re-check; if still gone, fall through to upstream so the
+            // request self-heals instead of surfacing a 502.
+            warn!(hex = %&hex[..8], path = ?hit.path, "cached blob vanished mid-response; falling back to upstream");
+            if state.cache.lookup(hex).await.is_some() {
+                // Another racing committer wrote it back; tell the client to
+                // retry the range so they get a clean read.
+                return (StatusCode::SERVICE_UNAVAILABLE, "cache transient, retry\n")
+                    .into_response();
+            }
+            passthrough_registry(state, registry, path, host, request).await
+        }
         Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
 }
@@ -2612,7 +2826,12 @@ fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
 fn is_response_header_allowed(name: &HeaderName) -> bool {
     if matches!(
         name,
-        &CONNECTION | &TRANSFER_ENCODING | &SET_COOKIE | &WWW_AUTHENTICATE | &LOCATION
+        &CONNECTION
+            | &TRANSFER_ENCODING
+            | &SET_COOKIE
+            | &WWW_AUTHENTICATE
+            | &LOCATION
+            | &CONTENT_LENGTH
     ) {
         return false;
     }

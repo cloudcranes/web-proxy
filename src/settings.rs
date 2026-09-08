@@ -109,6 +109,14 @@ impl Settings {
                 anyhow::bail!("invalid accel_port");
             }
         }
+        if let Some(token) = self.cf_token.as_deref() {
+            // Reject any byte that cannot legally appear in an HTTP header value
+            // before construction; CR/LF/non-ASCII would make
+            // `HeaderValue::from_str` panic on the API path.
+            if !token.chars().all(|c| c.is_ascii() && !c.is_ascii_control()) {
+                anyhow::bail!("invalid cf_token: contains non-visible or non-ASCII characters");
+            }
+        }
         Ok(())
     }
 
@@ -142,8 +150,14 @@ impl Settings {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
-        std::fs::write(path, self.to_disk_json().to_string())
-            .with_context(|| format!("write {}", path.display()))?;
+        // Write to a sibling tmp file then atomically rename so a crash
+        // mid-write can't leave a half-written settings.json that the next
+        // boot interprets as "no settings saved".
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, self.to_disk_json().to_string())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     }
 

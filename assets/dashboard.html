@@ -323,13 +323,14 @@
 </style>
 </head>
 <body>
+<div id="conn-banner" style="display:none;padding:10px 16px;background:var(--bad,#c0392b);color:#fff;font-size:13px;text-align:center;font-weight:600"></div>
 <div class="shell">
   <aside class="side">
     <div class="brand">
       <span class="mark">wp</span>
       <span class="txt"><b>web-proxy</b><span>LAN PULL GATEWAY</span></span>
     </div>
-    <div class="live"><span class="dot on" id="health-dot"></span><span id="health-text">运行中</span></div>
+    <div class="live"><span class="dot on" id="health-dot"></span><span id="health-text">运行中</span><span id="msg" style="margin-left:10px"></span></div>
     <nav class="nav" id="nav">
       <a href="#overview" data-view="overview">
         <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12 12 3l9 9"/><path d="M5 10v10h14V10"/></svg>总览
@@ -453,7 +454,6 @@
         </div>
         <div style="height:12px"></div>
         <div id="pulls"></div>
-        <div id="msg"></div>
       </div>
     </section>
 
@@ -586,6 +586,51 @@
 
 <script>
   const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  /* ---------- connection health ----------
+   * Track consecutive fetch failures so a silent /stats returning 500 (e.g.
+   * during a restart) flips the header dot red and shows a banner instead
+   * of leaving the user staring at stale numbers. */
+  let healthErrStreak = 0;
+  const HEALTH_ERR_THRESHOLD = 3;
+  function markFetchOk() {
+    if (healthErrStreak === 0) return;
+    healthErrStreak = 0;
+    const dot = document.getElementById('health-dot');
+    if (dot) dot.className = 'dot on';
+    const txt = document.getElementById('health-text');
+    if (txt) txt.textContent = '运行中';
+    const banner = document.getElementById('conn-banner');
+    if (banner) banner.style.display = 'none';
+  }
+  function markFetchFail(reason) {
+    healthErrStreak += 1;
+    if (healthErrStreak < HEALTH_ERR_THRESHOLD) return;
+    const dot = document.getElementById('health-dot');
+    if (dot) dot.className = 'dot off';
+    const txt = document.getElementById('health-text');
+    if (txt) txt.textContent = '连接异常';
+    const banner = document.getElementById('conn-banner');
+    if (banner) {
+      banner.style.display = 'block';
+      banner.textContent = '与网关连接中断(' + healthErrStreak + ' 次连续失败) · ' + reason + ' · 自动重试中';
+    }
+  }
+  /* Drop-in fetch wrapper: wraps json() callers' implicit success path and
+   * reports 5xx / network errors without breaking the existing `.then` flow. */
+  function watchedFetch(url, opts) {
+    return fetch(url, opts).then(r => {
+      if (r.status >= 500 || r.status === 401) {
+        markFetchFail('HTTP ' + r.status);
+      } else {
+        markFetchOk();
+      }
+      return r;
+    }).catch(err => {
+      markFetchFail(err && err.message ? err.message : '网络错误');
+      throw err;
+    });
+  }
   const SRC_HUES = ['var(--s0)', 'var(--s1)', 'var(--s2)', 'var(--s3)'];
 
   function fmtBytes(n) {
@@ -658,11 +703,10 @@
   }
   function refreshForView() {
     const r = PAGES[view].refresh;
-    if (r.stats) { loadStats(true); loadCharts(); }
+    if (r.stats) { loadStats(true); if (view === 'overview') loadCharts(); }
     if (r.pulls) loadPulls();
     if (r.downloads) loadDownloads();
     if (r.sources) { loadSources('lanes'); loadSources('lanes-full'); }
-    if (r.stats !== undefined && !r.stats) loadStats(true);
   }
   document.querySelectorAll('#nav a').forEach(a => {
     a.addEventListener('click', (e) => { e.preventDefault(); view = a.dataset.view; applyView(); });
@@ -724,7 +768,7 @@
   }
   const STATUS_TEXT = { pulling: '拉取中', retagging: '重命名中', done: '完成', failed: '失败' };
   function loadPulls() {
-    fetch('/pulls').then(r => r.json()).then(rows => {
+    watchedFetch('/pulls').then(r => r.json()).then(rows => {
       const box = document.getElementById('pulls');
       const nav = document.getElementById('nav-pull-count');
       if (!rows.length) {
@@ -781,7 +825,7 @@
   }
   function loadDownloads() {
     const myGen = ++downloadFetchGen;
-    fetch('/downloads').then(r => r.json()).then(rows => {
+    watchedFetch('/downloads').then(r => r.json()).then(rows => {
       if (myGen !== downloadFetchGen) return; // stale response, drop
       const tb = document.getElementById('downloads');
       const nav = document.getElementById('nav-dl-count');
@@ -805,8 +849,16 @@
         if (prev) {
           const dt = (now - prev.t) / 1000;
           const db = bytes - prev.bytes;
-          if (dt > 0 && db >= 0) {
+          // After a long pause (sleep, throttle, dev-tools break) the gap
+          // spans seconds-to-hours and `db / dt` averages across the whole
+          // window, producing wildly misleading rates like 3 KiB/s over a
+          // 4-hour nap. Skip the first post-resume sample and wait for the
+          // next 2s tick to get a fresh baseline.
+          if (dt > 0 && dt < 10 && db >= 0) {
             rateText = fmtBytes(db / dt) + '/s';
+          } else if (dt >= 10) {
+            // Reset baseline so the next tick has a valid (small) dt to use.
+            downloadRateMap[key] = { bytes, t: now };
           }
         }
         downloadRateMap[key] = { bytes, t: now };
@@ -847,25 +899,25 @@
           '<span class="dot' + (healthy ? '' : ' off') + '"></span>' +
           '<span class="name">' + esc(r.name) + '</span>' +
           '<span class="stats">' +
-            '<span>权重 <b>' + r.weight.toFixed(3) + '</b></span>' +
-            '<span>p50 <b>' + r.p50_ms + 'ms</b></span>' +
-            '<span>吞吐 <b>' + (r.throughput_bps ? fmtBytes(r.throughput_bps) + '/s' : '–') + '</b></span>' +
-            '<span>成功/失败 <b>' + r.success + '/' + r.failure + '</b></span>' +
+            '<span>权重 <b>' + Number(r.weight).toFixed(3) + '</b></span>' +
+            '<span>p50 <b>' + Number(r.p50_ms) + 'ms</b></span>' +
+            '<span>吞吐 <b>' + (r.throughput_bps ? fmtBytes(Number(r.throughput_bps)) + '/s' : '–') + '</b></span>' +
+            '<span>成功/失败 <b>' + Number(r.success) + '/' + Number(r.failure) + '</b></span>' +
             '<span>Range <b>' + (r.range_ok ? '支持' : '未声明') + '</b></span>' +
           '</span>' +
         '</div>' +
         '<div class="rail">' +
-          '<div class="fill" style="width:' + Math.min(100, r.weight * 100) + '%">' +
+          '<div class="fill" style="width:' + Math.min(100, Number(r.weight) * 100) + '%">' +
             (healthy ? '<div class="flow"></div>' : '') +
           '</div>' +
           '<span class="pct"><b>' + (healthy ? 'RACING' : 'OFFLINE') + '</b>' +
-          (healthy ? (r.weight * 100).toFixed(1) + '%' : '探测失败或 0 权重') + '</span>' +
+          (healthy ? (Number(r.weight) * 100).toFixed(1) + '%' : '探测失败或 0 权重') + '</span>' +
         '</div>';
       box.appendChild(div);
     });
   }
   function loadSources(target) {
-    fetch('/sources').then(r => r.json()).then(rows => {
+    watchedFetch('/sources').then(r => r.json()).then(rows => {
       const targets = target ? [target] : ['lanes', 'lanes-full'];
       targets.forEach(t => renderLanes(t, rows));
       const lamps = document.getElementById('s-lamps');
@@ -985,7 +1037,7 @@
     setTimeout(() => { el.textContent = ''; }, 6000);
   }
   function loadSettings() {
-    fetch('/settings').then(r => r.json()).then(s => {
+    watchedFetch('/settings').then(r => r.json()).then(s => {
       if (s.domain) document.getElementById('cfg-domain').value = s.domain;
       if (s.accel_domain) document.getElementById('cfg-accel-domain').value = s.accel_domain;
       if (s.accel_port) document.getElementById('cfg-accel-port').value = s.accel_port;
@@ -1058,8 +1110,14 @@
     const msg = document.getElementById('cert-msg');
     if (!job || !job.status || job.status === 'idle') { box.style.display = 'none'; return; }
     box.style.display = 'block';
-    badge.className = 'badge ' + (job.status === 'running' ? 'pulling' : job.status === 'done' ? 'done' : 'failed');
-    badge.textContent = job.status === 'running' ? '签发中' : job.status === 'done' ? '完成' : '失败';
+    // Explicit mapping keeps unknown backend statuses from rendering as
+    // literally `undefined` and gives the user a sensible default label.
+    let cls = 'failed', label = '失败: ' + job.status;
+    if (job.status === 'running') { cls = 'pulling'; label = '签发中'; }
+    else if (job.status === 'done') { cls = 'done'; label = '完成'; }
+    else if (job.status === 'failed') { cls = 'failed'; label = '失败'; }
+    badge.className = 'badge ' + cls;
+    badge.textContent = label;
     msg.textContent = job.message || '';
   }
   let certTimer = null;
@@ -1079,9 +1137,21 @@
     if (!confirm('确认重启网关容器？服务将中断约 3 秒。')) return;
     try {
       await fetch('/settings/restart', { method: 'POST' });
-      sayCfg('正在重启… 3 秒后刷新');
-      setTimeout(() => location.reload(), 3500);
-    } catch (e) { sayCfg('重启失败: ' + e, true); }
+      sayCfg('正在重启… 等待 /healthz');
+    } catch (e) { sayCfg('重启失败: ' + e, true); return; }
+    // Poll /healthz until 2xx, then reload. Cold cache / large image pulls
+    // can stretch the restart well past a fixed 3.5s; polling avoids a
+    // reload-into-connection-refused loop and keeps the user informed.
+    const deadline = Date.now() + 60_000;
+    const tick = async () => {
+      try {
+        const r = await fetch('/healthz', { cache: 'no-store' });
+        if (r.ok) { location.reload(); return; }
+      } catch (_) { /* still down */ }
+      if (Date.now() > deadline) { sayCfg('重启超时，请手动刷新', true); return; }
+      setTimeout(tick, 500);
+    };
+    setTimeout(tick, 200);
   }
 
   // Build the three artefacts a LAN machine needs to use this gateway:
@@ -1099,9 +1169,10 @@
       return;
     }
     // POSIX shell single-quote escape: replace every ' with '\''.
-    // Domain/port have already been validated as hostname chars on save;
-    // only the user-typed image ref needs guarding against injected
-    // `$(...)`, backticks, or command separators.
+    // Single-quoting alone prevents expansion of `$(...)` and backticks
+    // inside the string — only the literal content between the quotes is
+    // seen by the shell. Domain/port have already been validated as
+    // hostname chars on save; the image ref is a user-typed field.
     const shellQuote = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
     const pullLine = image
       ? `docker pull ${domain}:${port}/${shellQuote(image)}`
@@ -1156,7 +1227,7 @@
     fill.setAttribute('d', fillD.trim());
   }
   function loadCharts() {
-    fetch('/metrics/history').then(r => r.json()).then(j => {
+    watchedFetch('/metrics/history').then(r => r.json()).then(j => {
       const history = j.history || [];
       // Always render against the longest window so older samples line up
       // visually with the right edge; older than ~30 samples get clipped.
@@ -1180,7 +1251,7 @@
   }
 
   function loadStats(silent) {
-    fetch('/stats').then(r => r.json()).then(s => {
+    watchedFetch('/stats').then(r => r.json()).then(s => {
       const total = s.blob_cache_hits + s.blob_cache_misses;
       const ratio = total ? s.blob_cache_hits * 100 / total : 0;
       document.getElementById('g-ratio').textContent = total ? ratio.toFixed(0) + '%' : '–';
@@ -1205,13 +1276,18 @@
       const accelRow = document.getElementById('s-accelrow');
       if (s.accel_addr) {
         accelRow.style.display = 'flex';
-        document.getElementById('s-accel').textContent = ':' + String(s.accel_addr).split(':').pop();
+        // `accel_addr` may arrive as `host:port` or just `port` (when only
+        // the listen port is known). Show `:port`; if there's no colon the
+        // whole string IS the port, otherwise we want the trailing segment.
+        const accel = String(s.accel_addr);
+        const port = accel.includes(':') ? accel.split(':').pop() : accel;
+        document.getElementById('s-accel').textContent = ':' + port;
       }
     }).catch(e => { if (!silent) throw e; });
   }
 
   applyView();
-  loadStats(true); loadPulls(); loadDownloads(); loadSources('lanes'); loadSettings();
+  loadSettings();
 </script>
 </body>
 </html>

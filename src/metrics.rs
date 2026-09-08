@@ -4,6 +4,7 @@
 //! (30 s) and keeps the last `CAP` points in memory. The dashboard reads
 //! them via GET /metrics/history and renders sparklines.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ pub struct Sample {
 
 #[derive(Default)]
 struct State {
-    buf: Vec<Sample>,
+    buf: VecDeque<Sample>,
 }
 
 pub struct History {
@@ -42,15 +43,15 @@ impl History {
     }
 
     pub async fn snapshot(&self) -> Vec<Sample> {
-        self.state.lock().await.buf.clone()
+        self.state.lock().await.buf.iter().copied().collect()
     }
 
     async fn push(&self, sample: Sample) {
         let mut s = self.state.lock().await;
-        s.buf.push(sample);
-        if s.buf.len() > CAP {
-            s.buf.remove(0);
+        if s.buf.len() == CAP {
+            s.buf.pop_front();
         }
+        s.buf.push_back(sample);
     }
 }
 

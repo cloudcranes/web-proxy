@@ -583,6 +583,13 @@ fn validate_https(url: &str) -> Result<()> {
     if u.scheme() != "https" || u.host_str().is_none() || u.port_or_known_default() != Some(443) {
         bail!("source url must use https port 443: {url}");
     }
+    // Reject IP literals so a misconfigured sources.json can't turn the
+    // chunked downloader into an SSRF against link-local / private networks.
+    if let Some(host) = u.host_str() {
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            bail!("source url host must be a DNS name, not an IP literal: {url}");
+        }
+    }
     if !u.username().is_empty()
         || u.password().is_some()
         || u.query().is_some()
