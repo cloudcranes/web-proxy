@@ -388,7 +388,14 @@ impl SourcePool {
                     .unwrap_or(false);
                 let mut stats = pool.stats.write().await;
                 if let Some(slot) = stats.get_mut(index) {
-                    if status.is_success() || status.as_u16() == 401 {
+                    // 200/2xx: registry speaks v2. 401: reachable, wants a
+                    // token (the chunked downloader will fetch one).
+                    // 405: ghcr.io and a few others reject HEAD on /v2/
+                    // but still confirm the server is alive, so count it
+                    // as a reachable probe to avoid marking the source
+                    // permanently offline.
+                    let code = status.as_u16();
+                    if status.is_success() || code == 401 || code == 405 {
                         slot.success = slot.success.saturating_add(1);
                         slot.range_ok = slot.range_ok || range_ok;
                         slot.p50_ms = ewma_ms(slot.p50_ms, elapsed_ms);
