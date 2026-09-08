@@ -616,15 +616,15 @@
       banner.textContent = '与网关连接中断(' + healthErrStreak + ' 次连续失败) · ' + reason + ' · 自动重试中';
     }
   }
-  /* Drop-in fetch wrapper: wraps json() callers' implicit success path and
-   * reports 5xx / network errors without breaking the existing `.then` flow. */
+  /* Drop-in fetch wrapper: reports 5xx / network errors without breaking
+   * the existing `.then` flow. 401 is reported as "auth required" rather
+   * than "connection lost" — the user is connected, just needs the right
+   * bearer token (or the MGMT_BEARER_TOKEN env var isn't set). */
   function watchedFetch(url, opts) {
     return fetch(url, opts).then(r => {
-      if (r.status >= 500 || r.status === 401) {
-        markFetchFail('HTTP ' + r.status);
-      } else {
-        markFetchOk();
-      }
+      if (r.status >= 500) markFetchFail('HTTP ' + r.status);
+      else if (r.status === 401) markFetchFail('HTTP 401 · 需要鉴权令牌');
+      else markFetchOk();
       return r;
     }).catch(err => {
       markFetchFail(err && err.message ? err.message : '网络错误');
@@ -650,9 +650,12 @@
   function say(text, isError) {
     const el = document.getElementById('msg');
     if (!el) return;
+    // Clear any pending toast-clearing timer so a fresh message doesn't
+    // get wiped out by the previous toast's stale timer.
+    if (el._tmr) clearTimeout(el._tmr);
     el.textContent = text;
     el.className = isError ? 'bad' : 'ok';
-    setTimeout(() => { el.textContent = ''; }, 5000);
+    el._tmr = setTimeout(() => { el.textContent = ''; el._tmr = null; }, 5000);
   }
   function copyEl(id) {
     const text = document.getElementById(id).textContent;
@@ -724,7 +727,7 @@
     const btn = document.getElementById('btn-probe');
     btn.disabled = true;
     try {
-      const r = await fetch('/sources/probe', { method: 'POST' });
+      const r = await watchedFetch('/sources/probe', { method: 'POST' });
       const probe = document.getElementById('probe-status');
       if (probe) probe.textContent = r.ok ? '已触发测速' : '测速失败: HTTP ' + r.status;
       setTimeout(loadSources, 1200);
@@ -735,7 +738,7 @@
     if (!confirm('确认清空所有缓存 blob？进行中的下载会继续完成但进度作废。')) return;
     const btn = document.getElementById('btn-clear'); btn.disabled = true;
     try {
-      const r = await fetch('/cache/clear', { method: 'POST' });
+      const r = await watchedFetch('/cache/clear', { method: 'POST' });
       const j = await r.json();
       if (r.ok) {
         const warn = j.active_downloads ? '（' + j.active_downloads + ' 个下载进行中，其进度将作废）' : '';
@@ -754,7 +757,7 @@
     if (!image) return;
     btn.disabled = true;
     try {
-      const r = await fetch('/pull', {
+      const r = await watchedFetch('/pull', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image }),
       });
@@ -783,18 +786,19 @@
         const div = document.createElement('div');
         div.className = 'pulljob';
         const layers = (job.layers || []).map(l => {
-          const pct = l.total ? Math.min(100, l.current * 100 / l.total) : (/complete|exists/i.test(l.status) ? 100 : 0);
+          const pct = l.total ? Math.min(100, Number(l.current) * 100 / Number(l.total)) : (/complete|exists/i.test(l.status) ? 100 : 0);
           return '<div class="lrow"><span class="lid">' + esc(l.id) + '</span>' +
                  '<div class="lbar"><div style="width:' + pct + '%"></div></div>' +
                  '<span class="lst">' + esc(l.status) + (l.total ? ' ' + fmtBytes(l.current) + '/' + fmtBytes(l.total) : '') + '</span></div>';
         }).join('');
         const barLive = job.status === 'pulling' ? ' live' : '';
+        const jobPct = Math.min(100, Math.max(0, Number(job.percent) || 0));
         div.innerHTML =
           '<div class="row">' +
             '<span class="name">' + esc(job.image) + '</span>' +
             '<span class="badge ' + esc(job.status) + '">' + (STATUS_TEXT[job.status] || esc(job.status)) + '</span>' +
-            '<div class="dbar"><div class="' + barLive.trim() + '" style="width:' + (job.percent || 0) + '%"></div></div>' +
-            '<span class="muted mono" style="font-size:12px">' + (job.percent || 0) + '% · ' + fmtDur(job.elapsed_secs) + '</span>' +
+            '<div class="dbar"><div class="' + barLive.trim() + '" style="width:' + jobPct + '%"></div></div>' +
+            '<span class="muted mono" style="font-size:12px">' + jobPct + '% · ' + fmtDur(job.elapsed_secs) + '</span>' +
           '</div>' +
           (job.message ? '<div class="muted" style="font-size:12px;margin-top:4px">' + esc(job.message) + '</div>' : '') +
           (job.error ? '<div class="err">' + esc(job.error) + '</div>' : '') +
@@ -932,7 +936,7 @@
     }).catch(() => {});
   }
   function sourceField(label, key, value, placeholder) {
-    return '<div class="form-row"><label>' + label + '</label><input type="text" data-key="' + key + '" value="' + esc(value || '') + '" placeholder="' + placeholder + '"></div>';
+    return '<div class="form-row"><label>' + esc(label) + '</label><input type="text" data-key="' + esc(key) + '" value="' + esc(value || '') + '" placeholder="' + esc(placeholder) + '"></div>';
   }
   function addSourceRow(source) {
     const row = document.createElement('div');
@@ -987,7 +991,7 @@
     });
     btn.disabled = true;
     try {
-      const r = await fetch('/sources/config', {
+      const r = await watchedFetch('/sources/config', {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sources }),
       });
@@ -1062,7 +1066,7 @@
     if (v('cfg-cf-zone')) body.cf_zone_id = v('cfg-cf-zone');
     if (v('cfg-cf-account')) body.cf_account_id = v('cfg-cf-account');
     try {
-      const r = await fetch('/settings', {
+      const r = await watchedFetch('/settings', {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
@@ -1079,7 +1083,7 @@
     const btn = document.getElementById('btn-create-dns');
     btn.disabled = true;
     try {
-      const r = await fetch('/settings/dns-records', { method: 'POST' });
+      const r = await watchedFetch('/settings/dns-records', { method: 'POST' });
       const text = await r.text();
       let j = {};
       try { j = JSON.parse(text); } catch {}
@@ -1095,7 +1099,7 @@
     const btn = document.getElementById('btn-issue-cert');
     btn.disabled = true;
     try {
-      const r = await fetch('/settings/issue-cert', { method: 'POST' });
+      const r = await watchedFetch('/settings/issue-cert', { method: 'POST' });
       const text = await r.text();
       if (r.ok || r.status === 202) {
         sayCfg('已启动证书签发容器，请观察下方进度…');
@@ -1135,10 +1139,11 @@
   }
   async function doRestartGateway() {
     if (!confirm('确认重启网关容器？服务将中断约 3 秒。')) return;
-    try {
-      await fetch('/settings/restart', { method: 'POST' });
-      sayCfg('正在重启… 等待 /healthz');
-    } catch (e) { sayCfg('重启失败: ' + e, true); return; }
+    // Fire the restart POST without awaiting — the gateway may kill the
+    // connection mid-response, and a network error here is the expected
+    // happy path, not a failure. Always start the healthz poll.
+    watchedFetch('/settings/restart', { method: 'POST' }).catch(() => {});
+    sayCfg('正在重启… 等待 /healthz');
     // Poll /healthz until 2xx, then reload. Cold cache / large image pulls
     // can stretch the restart well past a fixed 3.5s; polling avoids a
     // reload-into-connection-refused loop and keeps the user informed.
@@ -1288,6 +1293,9 @@
 
   applyView();
   loadSettings();
+  // Initial liveness probe so a down gateway flips the dot/banner red on
+  // first paint instead of waiting for the first poll cycle to fail 3 times.
+  fetch('/healthz', { cache: 'no-store' }).then(markFetchOk, () => markFetchFail('启动探测'));
 </script>
 </body>
 </html>
