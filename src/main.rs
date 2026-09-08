@@ -321,7 +321,10 @@ async fn main() -> Result<()> {
         .route("/downloads", get(downloads))
         .route("/pulls", get(list_pulls))
         .route("/sources", get(sources_view))
-        .route("/sources/config", get(get_sources_config))
+        .route(
+            "/sources/config",
+            get(get_sources_config).put(save_sources_config),
+        )
         .fallback(not_found_on_http)
         .with_state(Arc::clone(&state));
 
