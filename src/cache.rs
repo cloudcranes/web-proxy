@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -308,39 +308,54 @@ pub struct CachedManifest {
 pub struct ManifestCache {
     ttl: Duration,
     max_entries: usize,
-    entries: Mutex<HashMap<(String, String), CachedManifest>>,
+    max_bytes: usize,
+    bytes: AtomicUsize,
+    entries: Mutex<HashMap<(String, String, String), CachedManifest>>,
 }
 
 impl ManifestCache {
-    pub fn new(ttl: Duration, max_entries: usize) -> Self {
+    pub fn new(ttl: Duration, max_entries: usize, max_bytes: usize) -> Self {
         Self {
             ttl,
             max_entries,
+            max_bytes,
+            bytes: AtomicUsize::new(0),
             entries: Mutex::new(HashMap::new()),
         }
     }
 
-    pub async fn get(&self, key: &(String, String)) -> Option<CachedManifest> {
+    pub async fn get(&self, key: &(String, String, String)) -> Option<CachedManifest> {
         let map = self.entries.lock().await;
         map.get(key)
             .filter(|entry| entry.stored.elapsed() < self.ttl)
             .cloned()
     }
 
-    pub async fn put(&self, key: (String, String), value: CachedManifest) {
+    pub async fn put(&self, key: (String, String, String), value: CachedManifest) {
+        if value.body.len() > self.max_bytes {
+            return;
+        }
         let mut map = self.entries.lock().await;
-        if map.len() >= self.max_entries {
-            map.retain(|_, entry| entry.stored.elapsed() < self.ttl);
-            if map.len() >= self.max_entries {
-                map.clear();
-            }
+        map.retain(|_, entry| entry.stored.elapsed() < self.ttl);
+        let mut bytes: usize = map.values().map(|entry| entry.body.len()).sum();
+        let replacing = map.get(&key).map(|entry| entry.body.len()).unwrap_or(0);
+        let next_bytes = bytes
+            .saturating_sub(replacing)
+            .saturating_add(value.body.len());
+        if map.len() >= self.max_entries || next_bytes > self.max_bytes {
+            map.clear();
+            bytes = value.body.len();
+        } else {
+            bytes = next_bytes;
         }
         map.insert(key, value);
+        self.bytes.store(bytes, Ordering::Relaxed);
     }
 
     pub async fn clear(&self) {
         let mut map = self.entries.lock().await;
         map.clear();
+        self.bytes.store(0, Ordering::Relaxed);
     }
 
     pub async fn len(&self) -> usize {
@@ -373,5 +388,27 @@ mod tests {
                 .map(|pair| pair[1].as_str()),
             Some("aa")
         );
+    }
+
+    #[tokio::test]
+    async fn manifest_cache_enforces_byte_budget() {
+        let cache = ManifestCache::new(Duration::from_secs(60), 10, 10);
+        let manifest = |size| CachedManifest {
+            content_type: None,
+            docker_digest: None,
+            body: axum::body::Bytes::from(vec![0; size]),
+            stored: Instant::now(),
+        };
+        cache
+            .put(("a".into(), "x".into(), "anon".into()), manifest(6))
+            .await;
+        cache
+            .put(("b".into(), "x".into(), "anon".into()), manifest(6))
+            .await;
+        assert_eq!(cache.len().await, 1);
+        assert!(cache
+            .get(&("b".into(), "x".into(), "anon".into()))
+            .await
+            .is_some());
     }
 }

@@ -51,7 +51,11 @@ impl SourceStats {
         } else {
             self.success as f64 / total as f64
         };
-        rate / (1.0 + self.p50_ms as f64 / 1000.0)
+        let mut score = rate / (1.0 + self.p50_ms as f64 / 1000.0);
+        if self.range_ok {
+            score *= 1.1;
+        }
+        score
     }
 }
 
@@ -142,7 +146,7 @@ impl SourcePool {
     /// Disabled sources (score 0) are skipped. Falls back to round-robin if
     /// nothing is healthy yet.
     pub async fn pick(&self) -> usize {
-        let weights = self.weights.read().await;
+        let weights = self.weights.read().await.clone();
         let n = weights.len();
         if n == 0 {
             return 0;
@@ -172,8 +176,24 @@ impl SourcePool {
                 }
             }
         }
-        // Fallback: round-robin through all sources.
-        (self.seq.fetch_add(1, Ordering::Relaxed) as usize) % n
+        // Fallback: prefer sources that still look usable. A source that was
+        // measured without Range support would fail every chunk, so leave it
+        // out once at least one Range-capable (or not-yet-measured) source
+        // exists; keep the all-sources round-robin as a last resort.
+        let stats = self.stats.read().await;
+        let eligible: Vec<usize> = stats
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.last_seen.is_none() || slot.range_ok)
+            .map(|(index, _)| index)
+            .collect();
+        let candidates = if eligible.is_empty() {
+            (0..n).collect()
+        } else {
+            eligible
+        };
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) as usize;
+        candidates[seq % candidates.len()]
     }
 
     pub async fn weights_snapshot(&self) -> Vec<(String, f64, SourceStats)> {
@@ -214,11 +234,15 @@ impl SourcePool {
     }
 
     pub async fn report_success(&self, index: usize) {
-        let mut stats = self.stats.write().await;
-        if let Some(slot) = stats.get_mut(index) {
-            slot.success = slot.success.saturating_add(1);
-            slot.last_seen = Some(Instant::now());
+        {
+            let mut stats = self.stats.write().await;
+            if let Some(slot) = stats.get_mut(index) {
+                slot.success = slot.success.saturating_add(1);
+                slot.range_ok = true;
+                slot.last_seen = Some(Instant::now());
+            }
         }
+        self.recompute_weights().await;
     }
 
     /// Feed a real bulk-transfer measurement into the per-source throughput
@@ -354,9 +378,13 @@ impl SourcePool {
     }
 
     async fn probe_all_arc(pool: Arc<Self>) {
+        let mut probes = tokio::task::JoinSet::new();
         for i in 0..pool.specs.len() {
             let me = Arc::clone(&pool);
-            tokio::spawn(async move { Self::probe_one_arc(me, i).await });
+            probes.spawn(async move { Self::probe_one_arc(me, i).await });
+        }
+        while probes.join_next().await.is_some() {
+            // Wait for every probe before recomputing weights.
         }
         pool.recompute_weights().await;
     }
@@ -754,6 +782,20 @@ mod tests {
         assert_eq!(ewma_ms(0, 1000), 1000);
         assert_eq!(ewma_ms(1000, 1000), 1000);
         assert_eq!(ewma_ms(100, 5000), 712);
+    }
+
+    #[test]
+    fn range_ok_source_scores_higher() {
+        let unknown = SourceStats {
+            success: 1,
+            ..Default::default()
+        };
+        let ranged = SourceStats {
+            success: 1,
+            range_ok: true,
+            ..Default::default()
+        };
+        assert!(ranged.score() > unknown.score());
     }
 
     #[tokio::test]

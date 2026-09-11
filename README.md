@@ -30,6 +30,7 @@
 | `CACHE_MAX_GB` | 否 | `10` | blob 缓存容量上限 |
 | `MANIFEST_TTL_SECS` | 否 | `60` | manifest 内存缓存 TTL |
 | `MANIFEST_CACHE_ENTRIES` | 否 | `2048` | manifest 缓存条目上限 |
+| `MANIFEST_CACHE_MAX_MB` | 否 | `64` | manifest 缓存总字节上限 |
 | `MAX_CONCURRENT_REQUESTS` | 否 | `128` | 全局并发上限 |
 | `MAX_REDIRECTS` | 否 | `8` | 上游重定向跟随上限 |
 | `UPSTREAM_CONNECT_TIMEOUT_SECS` | 否 | `10` | 上游连接超时 |

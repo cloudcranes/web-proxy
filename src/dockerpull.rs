@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 const MAX_FINISHED_JOBS: usize = 20;
+const MAX_ACTIVE_PULL_JOBS: usize = 32;
 
 /// A pull request resolved against the gateway host: what to tell the daemon
 /// and how to rename the result afterwards.
@@ -99,17 +100,24 @@ impl PullManager {
     pub async fn start(self: &Arc<Self>, spec: PullSpec) -> Result<Arc<PullJob>> {
         {
             let jobs = self.jobs.lock().await;
+            let mut active_count = 0;
             for job in jobs.iter() {
-                if job.spec.image != spec.image {
-                    continue;
-                }
                 let active = match job.state.try_lock() {
                     Ok(s) => matches!(s.status, JobStatus::Pulling | JobStatus::Retagging),
                     Err(_) => true,
                 };
                 if active {
+                    active_count += 1;
+                }
+                if job.spec.image != spec.image {
+                    continue;
+                }
+                if active {
                     return Ok(Arc::clone(job));
                 }
+            }
+            if active_count >= MAX_ACTIVE_PULL_JOBS {
+                bail!("too many active pull jobs (max {MAX_ACTIVE_PULL_JOBS})");
             }
         }
 
@@ -533,6 +541,13 @@ pub fn parse_image_ref(input: &str) -> Result<ParsedImageRef> {
 /// gateway host from the request (so the daemon pulls through us).
 pub fn plan_pull(image: &str, gateway_host: &str) -> Result<PullSpec> {
     let parsed = parse_image_ref(image)?;
+    let tag = parsed.tag.clone().or_else(|| {
+        if parsed.digest.is_none() {
+            Some("latest".to_owned())
+        } else {
+            None
+        }
+    });
     // ghcr pulls must keep the ghcr.io/ prefix in the reference so the
     // daemon's requests hit the gateway's ghcr route instead of being
     // treated as a bare docker.io mirror path.
@@ -547,10 +562,10 @@ pub fn plan_pull(image: &str, gateway_host: &str) -> Result<PullSpec> {
     } else {
         (
             Some(parsed.canonical.clone()),
-            Some(parsed.tag.clone().unwrap_or_else(|| "latest".to_owned())),
+            Some(tag.clone().unwrap_or_else(|| "latest".to_owned())),
         )
     };
-    let display = match (&parsed.tag, &parsed.digest) {
+    let display = match (&tag, &parsed.digest) {
         (Some(tag), _) => format!("{}:{tag}", parsed.canonical),
         (None, Some(digest)) => format!("{}@{digest}", parsed.canonical),
         (None, None) => format!("{}:latest", parsed.canonical),
@@ -558,7 +573,7 @@ pub fn plan_pull(image: &str, gateway_host: &str) -> Result<PullSpec> {
     Ok(PullSpec {
         image: display,
         pull_repo,
-        tag: parsed.tag,
+        tag,
         digest: parsed.digest,
         retag_repo,
         retag_tag,
@@ -671,6 +686,14 @@ mod tests {
         assert_eq!(plan.pull_repo, "192.168.1.107:20516/ghcr.io/owner/img");
         assert_eq!(plan.retag_repo.as_deref(), Some("ghcr.io/owner/img"));
         assert_eq!(plan.retag_tag.as_deref(), Some("latest"));
+    }
+
+    #[test]
+    fn default_tag_is_used_for_pull_and_retag() {
+        let plan = plan_pull("nginx", "h:1").unwrap();
+        assert_eq!(plan.tag.as_deref(), Some("latest"));
+        assert_eq!(plan.retag_tag.as_deref(), Some("latest"));
+        assert_eq!(plan.image, "nginx:latest");
     }
 
     #[test]

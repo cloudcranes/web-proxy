@@ -56,6 +56,8 @@ const DOCKER_API_VERSION: &str = "docker-distribution-api-version";
 const DOCKER_CONTENT_DIGEST: &str = "docker-content-digest";
 const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_MANIFEST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MANIFEST_CACHE_MAX_MB: u64 = 64;
+const MAX_WARM_BLOBS_PER_REQUEST: usize = 256;
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
 const BLOB_CHANNEL_DEPTH: usize = 8;
 const FILE_READ_BUFFER: usize = 64 * 1024;
@@ -204,7 +206,12 @@ async fn main() -> Result<()> {
 
     let manifest_ttl = env_parse("MANIFEST_TTL_SECS", 60_u64)?;
     let manifest_entries = env_parse("MANIFEST_CACHE_ENTRIES", 2048_usize)?;
-    let manifests = ManifestCache::new(Duration::from_secs(manifest_ttl), manifest_entries);
+    let manifest_cache_max_mb = env_parse("MANIFEST_CACHE_MAX_MB", DEFAULT_MANIFEST_CACHE_MAX_MB)?;
+    let manifests = ManifestCache::new(
+        Duration::from_secs(manifest_ttl),
+        manifest_entries,
+        (manifest_cache_max_mb as usize).saturating_mul(1024 * 1024),
+    );
 
     let client = {
         let mut builder = Client::builder()
@@ -1346,16 +1353,23 @@ async fn start_warm(State(state): State<Arc<AppState>>, request: Request) -> Res
         )
             .into_response();
     }
-    let manifest_bytes = match upstream.bytes().await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("manifest body read: {error}\n"),
-            )
-                .into_response();
-        }
-    };
+    if upstream
+        .content_length()
+        .is_some_and(|size| size > MAX_MANIFEST_RESPONSE_BYTES as u64)
+    {
+        return (StatusCode::BAD_GATEWAY, "manifest too large\n").into_response();
+    }
+    let manifest_bytes =
+        match read_response_body_capped(upstream, MAX_MANIFEST_RESPONSE_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("manifest body read: {error}\n"),
+                )
+                    .into_response();
+            }
+        };
     let digests = match parse_image_manifest_digests(&manifest_bytes) {
         Ok(digests) => digests,
         Err(error) => {
@@ -1366,6 +1380,13 @@ async fn start_warm(State(state): State<Arc<AppState>>, request: Request) -> Res
                 .into_response();
         }
     };
+    if digests.len() > MAX_WARM_BLOBS_PER_REQUEST {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("manifest references too many blobs (max {MAX_WARM_BLOBS_PER_REQUEST})\n"),
+        )
+            .into_response();
+    }
 
     let mut queued = 0;
     let mut cached = 0;
@@ -1535,6 +1556,22 @@ fn parse_image_manifest_digests(body: &[u8]) -> Result<Vec<(&'static str, String
         bail!("manifest has no recognized digest references");
     }
     Ok(out)
+}
+
+async fn read_response_body_capped(response: reqwest::Response, max_bytes: usize) -> Result<Bytes> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => return Err(error.into()),
+        };
+        if body.len() + chunk.len() > max_bytes {
+            return Err(anyhow::anyhow!("response exceeds {max_bytes} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
 }
 
 /// HEAD a blob URL to learn its `Content-Length`. Used by the warm flow
@@ -1920,10 +1957,15 @@ async fn proxy_manifest(
         .filter_map(|value| value.to_str().ok())
         .collect::<Vec<_>>()
         .join(", ");
+    // Never share cached manifests across Authorization identities.
     // The same path can arrive for two registries (ghcr.io prefix is
     // stripped, bare mirror mode is docker.io) — scope the cache key by
     // registry so one cannot serve the other's manifests.
-    let key = (registry.route_prefix().to_owned() + &path, accept);
+    let key = (
+        registry.route_prefix().to_owned() + &path,
+        accept,
+        auth_fingerprint(request.headers()),
+    );
 
     if let Some(hit) = state.manifests.get(&key).await {
         return manifest_response(&hit, head);
@@ -1965,15 +2007,9 @@ async fn proxy_manifest(
         .get(&DOCKER_CONTENT_DIGEST_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    if upstream
-        .content_length()
-        .is_some_and(|size| size > MAX_MANIFEST_RESPONSE_BYTES as u64)
-    {
-        return StatusCode::BAD_GATEWAY.into_response();
-    }
-    let body = match upstream.bytes().await {
-        Ok(bytes) if bytes.len() <= MAX_MANIFEST_RESPONSE_BYTES => bytes,
-        Ok(_) | Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    let body = match read_response_body_capped(upstream, MAX_MANIFEST_RESPONSE_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
     let hit = cache::CachedManifest {
         content_type: content_type.clone(),
@@ -2223,6 +2259,33 @@ async fn proxy_blob(
         Ok(value) => value,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
+
+    if request.headers().contains_key(AUTHORIZATION) {
+        // Authenticated requests carry a registry-specific credential that
+        // the multi-source chunker must not forward to unrelated mirrors.
+        // Stream the already-authenticated upstream response and tee it into
+        // the content-addressed cache instead.
+        let resp = single_source_blob_fallback(
+            state,
+            registry,
+            path.clone(),
+            hex.clone(),
+            digest_header,
+            upstream,
+            flight_guard,
+        )
+        .await;
+        record_log(
+            &state.logs,
+            "/v2/*/blobs/*",
+            request.method().as_str(),
+            resp.status().as_u16(),
+            started.elapsed(),
+            "auth_single",
+            format!("hex={} authenticated fallback", &hex[..8]),
+        );
+        return resp;
+    }
 
     let total_size = match content_length {
         Some(len) => len,
@@ -2515,21 +2578,31 @@ async fn passthrough_registry(
 }
 
 async fn proxy_github(state: &AppState, url: Url, request: Request) -> Response {
-    if !matches!(*request.method(), Method::GET | Method::HEAD) {
-        // Read-only: block POST/PUT/DELETE so the gateway can't be used as
-        // a write proxy for GitHub APIs (comment creation, gist updates,
-        // webhook delivery). The fallback route is not gated by
-        // MGMT_BEARER, so without this an internet-exposed HTTPS port
-        // would forward writes from any caller.
+    if !github_method_allowed(request.method(), url.path()) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
 
     let method = request.method().clone();
     let headers = request.headers().clone();
-    match fetch_following_redirects(state, url, method, &headers, None, false).await {
+    let body = if method == Method::POST {
+        match request.into_body().collect().await {
+            Ok(collected) => Some(collected.to_bytes()),
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid body\n").into_response(),
+        }
+    } else {
+        None
+    };
+    match fetch_following_redirects(state, url, method, &headers, body, false).await {
         Ok(response) => streaming_response(response, false),
         Err(response) => response,
     }
+}
+
+fn github_method_allowed(method: &Method, path: &str) -> bool {
+    // Git clone/fetch uses POST git-upload-pack; every other POST/PUT/DELETE
+    // stays blocked so the gateway is not a write proxy for GitHub APIs.
+    matches!(*method, Method::GET | Method::HEAD)
+        || (*method == Method::POST && path.ends_with("/git-upload-pack"))
 }
 
 async fn fetch_following_redirects(
@@ -2641,15 +2714,9 @@ async fn buffered_response(upstream: reqwest::Response, head: bool, max_bytes: u
     let body = if head {
         Body::empty()
     } else {
-        if upstream
-            .content_length()
-            .is_some_and(|size| size > max_bytes as u64)
-        {
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
-        let bytes = match upstream.bytes().await {
-            Ok(bytes) if bytes.len() <= max_bytes => bytes,
-            Ok(_) | Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        let bytes = match read_response_body_capped(upstream, max_bytes).await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
         };
         Body::from(bytes)
     };
@@ -3058,6 +3125,14 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+fn auth_fingerprint(headers: &HeaderMap) -> String {
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    for value in headers.get_all(AUTHORIZATION) {
+        hasher.update(value.as_bytes());
+    }
+    hex_encode(hasher.finish().as_ref())
+}
+
 fn validate_upstream_url(url: &Url) -> Result<()> {
     validate_https_url(url)?;
     let host = url.host_str().context("missing upstream host")?;
@@ -3405,6 +3480,22 @@ mod tests {
                 Some(StatusCode::NOT_FOUND)
             );
         }
+    }
+
+    #[test]
+    fn allows_only_git_upload_pack_post() {
+        assert!(github_method_allowed(
+            &Method::GET,
+            "/github.com/o/r/info/refs"
+        ));
+        assert!(github_method_allowed(
+            &Method::POST,
+            "/github.com/o/r/git-upload-pack"
+        ));
+        assert!(!github_method_allowed(
+            &Method::POST,
+            "/github.com/o/r/git-receive-pack"
+        ));
     }
 
     #[test]
